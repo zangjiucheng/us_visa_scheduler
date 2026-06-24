@@ -15,7 +15,6 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait as Wait
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
 
 from embassy import *
 
@@ -94,28 +93,27 @@ DATE_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/ap
 TIME_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
 SIGN_OUT_LINK = f"https://ais.usvisa-info.com/{EMBASSY}/niv/users/sign_out"
 
-# Fetch the JSON endpoints from inside the logged-in browser. We use fetch()
-# via execute_async_script instead of a synchronous XMLHttpRequest because a
-# sync XHR aborts with "Failed to execute 'send' on 'XMLHttpRequest': Failed to
-# load ..." (and no status code) when the server drops or redirects the
-# connection after a soft rate-limit. fetch() follows redirects, surfaces the
-# HTTP status, and reports network failures cleanly so we can re-login instead
-# of crash-looping on a dead session. credentials:'include' reuses the
-# browser's own _yatri_session cookie (the appointment page is same-origin).
+# Fetch the JSON endpoints from inside the logged-in browser with a *synchronous*
+# XMLHttpRequest — the same technique the site's own front-end uses, and the only
+# one that works reliably here (an injected fetch() gets "TypeError: Failed to
+# fetch" on this origin). We wrap it in try/catch so that when the server drops
+# or redirects the connection after a soft rate-limit (the sync send() would
+# otherwise throw "Failed to execute 'send' on 'XMLHttpRequest'") we return a
+# structured error instead of letting Selenium raise a generic exception — which
+# lets the main loop re-login cleanly instead of crash-looping on a dead session.
+# A sync XHR follows redirects automatically, so req.responseURL/req.status
+# reflect the final hop (e.g. a 200 HTML sign-in page if the session expired).
 JS_FETCH = """
-const url = arguments[0];
-const done = arguments[arguments.length - 1];
-fetch(url, {
-    method: 'GET',
-    credentials: 'include',
-    redirect: 'follow',
-    headers: {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'X-Requested-With': 'XMLHttpRequest'
-    }
-}).then(r => r.text().then(body => done({
-    status: r.status, redirected: r.redirected, url: r.url, body: body
-}))).catch(err => done({status: 0, error: String(err)}));
+try {
+    var req = new XMLHttpRequest();
+    req.open('GET', arguments[0], false);
+    req.setRequestHeader('Accept', 'application/json, text/javascript, */*; q=0.01');
+    req.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    req.send(null);
+    return JSON.stringify({status: req.status, url: req.responseURL, body: req.responseText});
+} catch (e) {
+    return JSON.stringify({status: 0, error: String(e)});
+}
 """
 
 
@@ -126,25 +124,28 @@ class SessionExpired(Exception):
 
 
 def fetch_json(url):
-    driver.set_script_timeout(60)
     try:
-        result = driver.execute_async_script(JS_FETCH, url) or {}
-    except TimeoutException as e:
-        raise SessionExpired(f"Fetch timed out for {url}: {e}") from e
+        raw = driver.execute_script(JS_FETCH, url)
+    except Exception as e:
+        raise SessionExpired(f"Script error fetching {url}: {e}") from e
+    try:
+        result = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, TypeError):
+        result = {}
     status = result.get("status")
     body = result.get("body") or ""
     final_url = result.get("url") or ""
     if not status:
-        # status 0 -> fetch() rejected (connection reset/refused/dropped).
+        # status 0 -> the sync XHR's send() threw (connection reset/dropped).
         raise SessionExpired(f"Network fetch failed for {url}: {result.get('error')}")
-    if result.get("redirected") or status in (301, 302, 303, 401, 403):
+    if status in (301, 302, 303, 401, 403) or "sign_in" in final_url:
         raise SessionExpired(
             f"Session expired (HTTP {status}, landed on {final_url}) fetching {url}"
         )
     try:
         return json.loads(body)
     except json.JSONDecodeError:
-        if "sign_in" in final_url or "user_email" in body or body.lstrip()[:1] == "<":
+        if "user_email" in body or body.lstrip()[:1] == "<":
             raise SessionExpired(f"Logged out — got HTML instead of JSON from {url}")
         raise RuntimeError(
             f"Unexpected response (HTTP {status}) when fetching {url}: {body[:500]}"
