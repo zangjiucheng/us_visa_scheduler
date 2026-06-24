@@ -1,0 +1,16 @@
+# Local config with real credentials — never commit
+config.ini
+
+# Python virtual environment
+.venv/
+venv/
+
+# Runtime logs produced by visa.py
+log_*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Playwright / browser artifacts
+.playwright-cli/

@@ -1,0 +1,3 @@
+selenium>=4.45.0
+requests>=2.34.2
+sendgrid>=6.12.5

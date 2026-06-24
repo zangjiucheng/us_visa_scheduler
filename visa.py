@@ -6,11 +6,9 @@ import configparser
 from datetime import datetime
 
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait as Wait
 from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
 
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
@@ -28,8 +26,8 @@ PASSWORD = config['PERSONAL_INFO']['PASSWORD']
 # https://ais.usvisa-info.com/en-am/niv/schedule/{SCHEDULE_ID}/appointment
 SCHEDULE_ID = config['PERSONAL_INFO']['SCHEDULE_ID']
 # Target Period:
-PRIOD_START = config['PERSONAL_INFO']['PRIOD_START']
-PRIOD_END = config['PERSONAL_INFO']['PRIOD_END']
+PERIOD_START = config['PERSONAL_INFO']['PERIOD_START']
+PERIOD_END = config['PERSONAL_INFO']['PERIOD_END']
 # Embassy Section:
 YOUR_EMBASSY = config['PERSONAL_INFO']['YOUR_EMBASSY'] 
 EMBASSY = Embassies[YOUR_EMBASSY][0]
@@ -214,8 +212,8 @@ def get_available_date(dates):
         # print(f'{new_date.date()} : {result}', end=", ")
         return result
     
-    PED = datetime.strptime(PRIOD_END, "%Y-%m-%d")
-    PSD = datetime.strptime(PRIOD_START, "%Y-%m-%d")
+    PED = datetime.strptime(PERIOD_END, "%Y-%m-%d")
+    PSD = datetime.strptime(PERIOD_START, "%Y-%m-%d")
     for d in dates:
         date = d.get('date')
         if is_in_period(date, PSD, PED):
@@ -229,8 +227,10 @@ def info_logger(file_path, log):
         file.write(str(datetime.now().time()) + ":\n" + log + "\n")
 
 
+# selenium >= 4.6 ships Selenium Manager, which auto-resolves the matching
+# chromedriver — no webdriver-manager needed.
 if LOCAL_USE:
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()))
+    driver = webdriver.Chrome(options=webdriver.ChromeOptions())
 else:
     driver = webdriver.Remote(command_executor=HUB_ADDRESS, options=webdriver.ChromeOptions())
 
@@ -273,7 +273,7 @@ if __name__ == "__main__":
                     # A good date to schedule for
                     END_MSG_TITLE, msg = reschedule(date)
                     break
-                RETRY_WAIT_TIME = random.randint(RETRY_TIME_L_BOUND, RETRY_TIME_U_BOUND)
+                RETRY_WAIT_TIME = random.randint(int(RETRY_TIME_L_BOUND), int(RETRY_TIME_U_BOUND))
                 t1 = time.time()
                 total_time = t1 - t0
                 msg = "\nWorking Time:  ~ {:.2f} minutes".format(total_time/minute)
@@ -296,9 +296,9 @@ if __name__ == "__main__":
             END_MSG_TITLE = "EXCEPTION"
             break
 
-print(msg)
-info_logger(LOG_FILE_NAME, msg)
-send_notification(END_MSG_TITLE, msg)
-driver.get(SIGN_OUT_LINK)
-driver.stop_client()
-driver.quit()
+    print(msg)
+    info_logger(LOG_FILE_NAME, msg)
+    send_notification(END_MSG_TITLE, msg)
+    driver.get(SIGN_OUT_LINK)
+    driver.stop_client()
+    driver.quit()
