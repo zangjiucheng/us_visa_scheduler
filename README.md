@@ -3,7 +3,7 @@ The visa_rescheduler is a bot for US VISA (usvisa-info.com) appointment reschedu
 
 ## Prerequisites
 - Having a US VISA appointment scheduled already.
-- [Optional] API token from Pushover and/or a Sendgrid (for notifications)(You also can use the esender.php file in this repo as an email pusher on your website)
+- [Optional] A Discord bot in your server (for notifications)
 
 ## Attention
 - Right now, there are lots of unsupported embassies in our repository. A list of supported embassies is presented in the 'embassy.py' file.
@@ -22,9 +22,40 @@ pip install -r requirements.txt
 ## How to use
 - Initial setup!
 - Edit information [config.ini.example file]. Then remove the ".example" from file name.
-- [Optional] Edit your push notification accounts information [config.ini.example file].
-- [Optional] Edit your website push notification [config.ini.example and esender.php files].
+- [Optional] Set up a Discord bot and add `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` in `config.ini` (see comments in `config.ini.example`).
 - Run visa.py file, using `python3 visa.py`
+
+## Run as a server daemon (Linux + systemd)
+
+1. Copy and edit `config.ini` (set `HEADLESS = True` on a server without a display).
+2. Install Google Chrome or Chromium on the server.
+3. Install and enable the systemd service:
+
+```bash
+chmod +x deploy/install-daemon.sh scripts/run.sh
+./deploy/install-daemon.sh
+sudo systemctl start visa-scheduler
+```
+
+Useful commands:
+
+```bash
+sudo systemctl status visa-scheduler   # service status
+sudo systemctl restart visa-scheduler  # restart after config changes
+tail -f logs/daemon.log                # stdout/stderr from the daemon
+```
+
+To run as a different user or path:
+
+```bash
+SERVICE_USER=visa INSTALL_DIR=/opt/us_visa_scheduler ./deploy/install-daemon.sh
+```
+
+For a one-off foreground run (without systemd):
+
+```bash
+./scripts/run.sh
+```
 
 ## TODO
 - Make timing optimum. (There are lots of unanswered questions. How is the banning algorithm? How can we avoid it? etc.)

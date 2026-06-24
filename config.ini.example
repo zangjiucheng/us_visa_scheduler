@@ -5,29 +5,28 @@ PASSWORD = account_pass
 ; Find SCHEDULE_ID in re-schedule page link:
 ; https://ais.usvisa-info.com/en-am/niv/schedule/{SCHEDULE_ID}/appointment
 SCHEDULE_ID = 99999999
-; Target Period:
-PERIOD_START = 2023-03-20
-PERIOD_END = 2023-06-01
+; Target Period (YYYY-MM-DD, must be valid calendar dates):
+PERIOD_START = 2027-10-01
+PERIOD_END = 2027-11-30
 ; Change "en-am-yer", based on your embassy Abbreviation in embassy.py list.
 YOUR_EMBASSY = en-am-yer
 
 [CHROMEDRIVER]
 ; Details for the script to control Chrome
 LOCAL_USE = True
+; Use headless Chrome on servers without a display (recommended for daemon)
+HEADLESS = False
 ; Optional: HUB_ADDRESS is mandatory only when LOCAL_USE = False
 HUB_ADDRESS = http://localhost:9515/wd/hub
 
 [NOTIFICATION]
-; Get push notifications via https://pushover.net/ (optional)
-PUSHOVER_TOKEN = 
-PUSHOVER_USER = 
-; Get email notifications via https://sendgrid.com/ (optional)
-SENDGRID_API_KEY = 
-; Get push notifications via PERSONAL WEBSITE http://yoursite.com (Optional)
-PERSONAL_SITE_USER = *********
-PERSONAL_SITE_PASS = *********
-PUSH_TARGET_EMAIL = notifyemail@gmail.com
-PERSONAL_PUSHER_URL = https://yoursite.com/api/esender.php
+; Discord bot notifications (https://discord.com/developers/applications)
+; 1. Create an application -> Bot -> Reset Token -> copy DISCORD_BOT_TOKEN
+; 2. Enable "Message Content Intent" under Bot settings if needed
+; 3. Invite the bot to your server (OAuth2 -> URL Generator -> bot scope + Send Messages)
+; 4. Right-click the target channel -> Copy Channel ID (enable Developer Mode in Discord settings)
+DISCORD_BOT_TOKEN =
+DISCORD_CHANNEL_ID =
 
 [TIME]
 ; Time between retries/checks for available dates (seconds)
