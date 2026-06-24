@@ -2,12 +2,15 @@ import time
 import json
 import random
 import re
+import os
+import shutil
 import traceback
 import requests
 import configparser
 from datetime import datetime
 
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait as Wait
 from selenium.webdriver.common.by import By
@@ -72,6 +75,8 @@ BAN_COOLDOWN_TIME = config['TIME'].getfloat('BAN_COOLDOWN_TIME')
 # Details for the script to control Chrome
 LOCAL_USE = config['CHROMEDRIVER'].getboolean('LOCAL_USE')
 HEADLESS = config['CHROMEDRIVER'].getboolean('HEADLESS', fallback=False)
+CHROME_BIN = config['CHROMEDRIVER'].get('CHROME_BIN', '').strip()
+CHROMEDRIVER_PATH = config['CHROMEDRIVER'].get('CHROMEDRIVER_PATH', '').strip()
 # Optional: HUB_ADDRESS is mandatory only when LOCAL_USE = False
 HUB_ADDRESS = config['CHROMEDRIVER']['HUB_ADDRESS']
 
@@ -454,9 +459,19 @@ class RunReporter:
 
 
 # selenium >= 4.6 ships Selenium Manager, which auto-resolves the matching
-# chromedriver — no webdriver-manager needed.
+# chromedriver — no webdriver-manager needed. On NixOS, use packaged binaries.
 def build_chrome_options():
     options = webdriver.ChromeOptions()
+    chrome_bin = (
+        CHROME_BIN
+        or os.environ.get("CHROME_BIN")
+        or os.environ.get("SE_BROWSER_BINARY")
+        or shutil.which("chromium")
+        or shutil.which("google-chrome")
+        or shutil.which("chromium-browser")
+    )
+    if chrome_bin:
+        options.binary_location = chrome_bin
     if HEADLESS:
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
@@ -466,8 +481,24 @@ def build_chrome_options():
     return options
 
 
+def create_driver():
+    options = build_chrome_options()
+    chromedriver_path = (
+        CHROMEDRIVER_PATH
+        or os.environ.get("CHROMEDRIVER_PATH")
+        or os.environ.get("SE_CHROMEDRIVER")
+        or shutil.which("chromedriver")
+    )
+    if LOCAL_USE:
+        if chromedriver_path:
+            service = ChromeService(executable_path=chromedriver_path)
+            return webdriver.Chrome(service=service, options=options)
+        return webdriver.Chrome(options=options)
+    return webdriver.Remote(command_executor=HUB_ADDRESS, options=options)
+
+
 if LOCAL_USE:
-    driver = webdriver.Chrome(options=build_chrome_options())
+    driver = create_driver()
 else:
     driver = webdriver.Remote(command_executor=HUB_ADDRESS, options=build_chrome_options())
 

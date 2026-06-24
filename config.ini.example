@@ -16,6 +16,9 @@ YOUR_EMBASSY = en-am-yer
 LOCAL_USE = True
 ; Use headless Chrome on servers without a display (recommended for daemon)
 HEADLESS = False
+; Optional: override browser/driver paths (set automatically on NixOS)
+CHROME_BIN =
+CHROMEDRIVER_PATH =
 ; Optional: HUB_ADDRESS is mandatory only when LOCAL_USE = False
 HUB_ADDRESS = http://localhost:9515/wd/hub
 

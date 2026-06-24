@@ -11,6 +11,7 @@ let
     selenium
     requests
   ]);
+  chromedriver = chromium.driver;
   src = lib.cleanSourceWith {
     src = lib.cleanSource ../.;
     filter = path: _type:
@@ -24,14 +25,17 @@ stdenv.mkDerivation {
   inherit src;
 
   nativeBuildInputs = [ makeWrapper ];
-  buildInputs = [ python chromium ];
+  buildInputs = [ python chromium chromedriver ];
 
   installPhase = ''
     mkdir -p $out/bin $out/share/us-visa-scheduler
     cp "$src/visa.py" "$src/embassy.py" $out/share/us-visa-scheduler/
     makeWrapper ${python}/bin/python $out/bin/us-visa-scheduler \
       --add-flags $out/share/us-visa-scheduler/visa.py \
-      --prefix PATH : ${lib.makeBinPath [ chromium ]}
+      --prefix PATH : ${lib.makeBinPath [ chromium chromedriver ]} \
+      --set CHROME_BIN ${lib.getExe chromium} \
+      --set CHROMEDRIVER_PATH ${lib.getExe chromedriver} \
+      --set SE_OFFLINE true
   '';
 
   meta.mainProgram = "us-visa-scheduler";

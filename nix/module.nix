@@ -95,8 +95,10 @@ in
         RestartSec = 30;
         Environment = [
           "HOME=${cfg.dataDir}"
-          "SE_CACHE_PATH=${cfg.dataDir}/.cache/selenium"
           "XDG_CACHE_HOME=${cfg.dataDir}/.cache"
+          "CHROME_BIN=${lib.getExe pkgs.chromium}"
+          "CHROMEDRIVER_PATH=${lib.getExe pkgs.chromium.driver}"
+          "SE_OFFLINE=true"
         ];
       };
     };
