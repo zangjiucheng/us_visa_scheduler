@@ -25,7 +25,83 @@ pip install -r requirements.txt
 - [Optional] Set up a Discord bot and add `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` in `config.ini` (see comments in `config.ini.example`).
 - Run visa.py file, using `python3 visa.py`
 
-## Run as a server daemon (Linux + systemd)
+## Run as a daemon on NixOS
+
+This repo ships a NixOS module (Chromium + Python deps + systemd service).
+
+### 1. Create your config
+
+```bash
+cp config.ini.example /etc/nixos/us-visa-scheduler.ini
+# edit credentials, embassy, Discord, and set:
+#   HEADLESS = True
+```
+
+### 2. Enable the module in your flake
+
+```nix
+{
+  inputs.us-visa-scheduler.url = "path:/path/to/us_visa_scheduler";
+
+  outputs = { self, nixpkgs, us-visa-scheduler, ... }: {
+    nixosConfigurations.myserver = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        us-visa-scheduler.nixosModules.us-visa-scheduler
+        {
+          services.us-visa-scheduler = {
+            enable = true;
+            configFile = /etc/nixos/us-visa-scheduler.ini;
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Without a flake, import the module directly:
+
+```nix
+{ ... }:
+
+{
+  imports = [ /path/to/us_visa_scheduler/nix/module.nix ];
+
+  services.us-visa-scheduler = {
+    enable = true;
+    configFile = /etc/nixos/us-visa-scheduler.ini;
+  };
+}
+```
+
+### 3. Deploy
+
+```bash
+sudo nixos-rebuild switch
+```
+
+### Service commands
+
+```bash
+sudo systemctl status us-visa-scheduler
+sudo systemctl restart us-visa-scheduler
+sudo journalctl -u us-visa-scheduler -f
+tail -f /var/lib/us-visa-scheduler/log_*.txt
+```
+
+### Local test (without installing the service)
+
+From the project directory with `config.ini` present:
+
+```bash
+nix run . -- 
+```
+
+## Run as a daemon on other Linux (systemd)
+
+For non-NixOS Linux servers:
 
 1. Copy and edit `config.ini` (set `HEADLESS = True` on a server without a display).
 2. Install Google Chrome or Chromium on the server.
