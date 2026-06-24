@@ -3,6 +3,7 @@
   stdenv,
   python3,
   chromium,
+  chromedriver,
   makeWrapper,
 }:
 
@@ -11,7 +12,6 @@ let
     selenium
     requests
   ]);
-  chromedriver = chromium.driver;
   src = lib.cleanSourceWith {
     src = lib.cleanSource ../.;
     filter = path: _type:

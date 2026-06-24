@@ -97,7 +97,7 @@ in
           "HOME=${cfg.dataDir}"
           "XDG_CACHE_HOME=${cfg.dataDir}/.cache"
           "CHROME_BIN=${lib.getExe pkgs.chromium}"
-          "CHROMEDRIVER_PATH=${lib.getExe pkgs.chromium.driver}"
+          "CHROMEDRIVER_PATH=${lib.getExe pkgs.chromedriver}"
           "SE_OFFLINE=true"
         ];
       };
