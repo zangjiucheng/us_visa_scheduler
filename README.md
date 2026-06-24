@@ -52,7 +52,7 @@ cp config.ini.example /etc/nixos/us-visa-scheduler.ini
         {
           services.us-visa-scheduler = {
             enable = true;
-            configFile = /etc/nixos/us-visa-scheduler.ini;
+            configFile = "/etc/nixos/us-visa-scheduler.ini";
           };
         }
       ];
@@ -71,7 +71,7 @@ Without a flake, import the module directly:
 
   services.us-visa-scheduler = {
     enable = true;
-    configFile = /etc/nixos/us-visa-scheduler.ini;
+    configFile = "/etc/nixos/us-visa-scheduler.ini";
   };
 }
 ```

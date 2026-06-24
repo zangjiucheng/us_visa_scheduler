@@ -19,12 +19,13 @@ in
     };
 
     configFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
+      type = lib.types.nullOr lib.types.str;
+      default = "/etc/nixos/us-visa-scheduler.ini";
       example = "/etc/nixos/us-visa-scheduler.ini";
       description = ''
-        Path to config.ini with credentials, embassy, and Discord settings.
-        Set HEADLESS = True for headless servers.
+        Absolute path on the target machine to config.ini with credentials,
+        embassy, and Discord settings. Use a string path (not a Nix path) so
+        evaluation stays pure. Set HEADLESS = True for headless servers.
       '';
     };
 
@@ -48,8 +49,8 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [
       {
-        assertion = cfg.configFile != null;
-        message = "services.us-visa-scheduler.configFile must be set when the service is enabled.";
+        assertion = cfg.configFile != null && cfg.configFile != "";
+        message = "services.us-visa-scheduler.configFile must be a non-empty path when the service is enabled.";
       }
     ];
 
@@ -67,7 +68,6 @@ in
       "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${cfg.dataDir}/logs 0750 ${cfg.user} ${cfg.group} -"
       "d ${cfg.dataDir}/.cache 0750 ${cfg.user} ${cfg.group} -"
-      "L+ ${cfg.dataDir}/config.ini - - - - ${cfg.configFile}"
     ];
 
     systemd.services.us-visa-scheduler = {
@@ -75,6 +75,15 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+
+      preStart = ''
+        config_src=${lib.escapeShellArg cfg.configFile}
+        if [ ! -f "$config_src" ]; then
+          echo "us-visa-scheduler: missing config $config_src" >&2
+          exit 1
+        fi
+        ln -sfn "$config_src" ${cfg.dataDir}/config.ini
+      '';
 
       serviceConfig = {
         Type = "simple";

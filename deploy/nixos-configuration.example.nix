@@ -13,6 +13,7 @@
 {
   services.us-visa-scheduler = {
     enable = true;
-    configFile = /etc/nixos/us-visa-scheduler.ini;
+    # String path on the target machine (pure-eval safe).
+    configFile = "/etc/nixos/us-visa-scheduler.ini";
   };
 }
