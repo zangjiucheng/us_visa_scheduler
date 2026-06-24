@@ -14,8 +14,9 @@ YOUR_EMBASSY = en-am-yer
 [CHROMEDRIVER]
 ; Details for the script to control Chrome
 LOCAL_USE = True
-; Use headless Chrome on servers without a display (recommended for daemon)
-HEADLESS = False
+; Use headless Chrome on servers without a display (recommended for daemon).
+; The NixOS service runs under xvfb-run, so HEADLESS = False also works.
+HEADLESS = True
 ; Optional: override browser/driver paths (set automatically on NixOS)
 CHROME_BIN =
 CHROMEDRIVER_PATH =

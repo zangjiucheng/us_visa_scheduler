@@ -271,16 +271,30 @@ def auto_action(label, find_by, el_type, action, value, sleep_time=0):
 
 
 def start_process():
-    # Bypass reCAPTCHA
+    print(f"\tOpening sign-in: {SIGN_IN_LINK}")
     driver.get(SIGN_IN_LINK)
     time.sleep(STEP_TIME)
-    Wait(driver, 60).until(EC.presence_of_element_located((By.NAME, "commit")))
-    auto_action("Click bounce", "xpath", '//a[@class="down-arrow bounce"]', "click", "", STEP_TIME)
+    try:
+        Wait(driver, 90).until(
+            EC.any_of(
+                EC.presence_of_element_located((By.NAME, "commit")),
+                EC.presence_of_element_located((By.ID, "user_email")),
+            )
+        )
+    except Exception as e:
+        save_debug_artifacts("login-page")
+        raise RuntimeError(
+            f"Login page did not load (title={driver.title!r}, url={driver.current_url!r}): {e}"
+        ) from e
+    try:
+        auto_action("Click bounce", "xpath", '//a[@class="down-arrow bounce"]', "click", "", STEP_TIME)
+    except Exception:
+        print("\tNo bounce arrow on page, continuing.")
     auto_action("Email", "id", "user_email", "send", USERNAME, STEP_TIME)
     auto_action("Password", "id", "user_password", "send", PASSWORD, STEP_TIME)
     auto_action("Privacy", "class", "icheckbox", "click", "", STEP_TIME)
     auto_action("Enter Panel", "name", "commit", "click", "", STEP_TIME)
-    Wait(driver, 60).until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), '" + REGEX_CONTINUE + "')]")))
+    Wait(driver, 90).until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), '" + REGEX_CONTINUE + "')]")))
     print("\n\tlogin successful!\n")
 
 def reschedule(date):
@@ -458,8 +472,31 @@ class RunReporter:
         self.first_round_reported = True
 
 
-# selenium >= 4.6 ships Selenium Manager, which auto-resolves the matching
-# chromedriver — no webdriver-manager needed. On NixOS, use packaged binaries.
+def save_debug_artifacts(label):
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"debug_{label}_{ts}"
+    try:
+        driver.save_screenshot(f"{base}.png")
+        print(f"\tDebug screenshot: {base}.png")
+    except Exception as e:
+        print(f"\tCould not save screenshot: {e}")
+    try:
+        with open(f"{base}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        print(f"\tDebug HTML: {base}.html")
+    except Exception as e:
+        print(f"\tCould not save HTML: {e}")
+
+
+def should_use_headless():
+    if HEADLESS:
+        return True
+    if not os.environ.get("DISPLAY"):
+        print("No DISPLAY set; forcing headless Chrome.")
+        return True
+    return False
+
+
 def build_chrome_options():
     options = webdriver.ChromeOptions()
     chrome_bin = (
@@ -472,12 +509,15 @@ def build_chrome_options():
     )
     if chrome_bin:
         options.binary_location = chrome_bin
-    if HEADLESS:
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    if should_use_headless():
         options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--disable-gpu")
-        options.add_argument("--window-size=1920,1080")
     return options
 
 
@@ -497,13 +537,27 @@ def create_driver():
     return webdriver.Remote(command_executor=HUB_ADDRESS, options=options)
 
 
-if LOCAL_USE:
+driver = None
+
+
+def init_driver():
+    global driver
     driver = create_driver()
-else:
-    driver = webdriver.Remote(command_executor=HUB_ADDRESS, options=build_chrome_options())
+    return driver
+
+
+def reset_driver():
+    global driver
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    return init_driver()
 
 
 if __name__ == "__main__":
+    init_driver()
     first_loop = True
     END_MSG_TITLE = "STOP"
     reporter = RunReporter()
@@ -516,7 +570,23 @@ if __name__ == "__main__":
             total_time = 0
             Req_count = 0
             reset_appointment_page_state()
-            start_process()
+            while True:
+                try:
+                    start_process()
+                    break
+                except Exception as e:
+                    msg = f"Login failed: {e}\n{traceback.format_exc()}"
+                    print(msg)
+                    info_logger(LOG_FILE_NAME, msg)
+                    send_notification("LOGIN_FAIL", msg[:1900])
+                    retry_low = int(RETRY_TIME_L_BOUND)
+                    retry_high = int(RETRY_TIME_U_BOUND)
+                    if retry_low > retry_high:
+                        retry_low, retry_high = retry_high, retry_low
+                    wait_s = random.randint(retry_low, retry_high)
+                    print(f"\tRetrying login in {wait_s}s after browser reset...")
+                    reset_driver()
+                    time.sleep(wait_s)
             first_loop = False
         Req_count += 1
         try:

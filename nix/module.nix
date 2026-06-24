@@ -76,6 +76,11 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      path = with pkgs; [
+        pkgs.xvfb-run
+        pkgs.xorg.xvfb
+      ];
+
       preStart = ''
         config_src=${lib.escapeShellArg cfg.configFile}
         if [ ! -f "$config_src" ]; then
@@ -90,7 +95,7 @@ in
         User = cfg.user;
         Group = cfg.group;
         WorkingDirectory = cfg.dataDir;
-        ExecStart = lib.getExe cfg.package;
+        ExecStart = "${pkgs.xvfb-run}/bin/xvfb-run -a --server-args='-screen 0 1920x1080x24' ${lib.getExe cfg.package}";
         Restart = "always";
         RestartSec = 30;
         Environment = [
