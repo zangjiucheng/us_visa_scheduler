@@ -77,6 +77,11 @@ LOCAL_USE = config['CHROMEDRIVER'].getboolean('LOCAL_USE')
 HEADLESS = config['CHROMEDRIVER'].getboolean('HEADLESS', fallback=False)
 CHROME_BIN = config['CHROMEDRIVER'].get('CHROME_BIN', '').strip()
 CHROMEDRIVER_PATH = config['CHROMEDRIVER'].get('CHROMEDRIVER_PATH', '').strip()
+USER_AGENT = config['CHROMEDRIVER'].get('USER_AGENT', '').strip()
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 # Optional: HUB_ADDRESS is mandatory only when LOCAL_USE = False
 HUB_ADDRESS = config['CHROMEDRIVER']['HUB_ADDRESS']
 
@@ -270,10 +275,25 @@ def auto_action(label, find_by, el_type, action, value, sleep_time=0):
         time.sleep(sleep_time)
 
 
+def is_blocked_page():
+    title = (driver.title or "").lower()
+    if "403" in title or "forbidden" in title:
+        return True
+    snippet = driver.page_source[:4000].lower()
+    return "403 forbidden" in snippet or "access denied" in snippet
+
+
 def start_process():
     print(f"\tOpening sign-in: {SIGN_IN_LINK}")
     driver.get(SIGN_IN_LINK)
     time.sleep(STEP_TIME)
+    if is_blocked_page():
+        save_debug_artifacts("403-forbidden")
+        raise RuntimeError(
+            "Site returned 403 Forbidden (bot/WAF block). "
+            "Set HEADLESS = False in config.ini (NixOS service uses xvfb-run), "
+            "or run the scheduler from your home computer instead of the server."
+        )
     try:
         Wait(driver, 90).until(
             EC.any_of(
@@ -491,10 +511,25 @@ def save_debug_artifacts(label):
 def should_use_headless():
     if HEADLESS:
         return True
-    if not os.environ.get("DISPLAY"):
-        print("No DISPLAY set; forcing headless Chrome.")
-        return True
-    return False
+    if os.environ.get("DISPLAY"):
+        print(f"Using headed Chrome on DISPLAY={os.environ['DISPLAY']}")
+        return False
+    print("No DISPLAY set; forcing headless Chrome.")
+    return True
+
+
+def apply_stealth(drv):
+    try:
+        drv.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+window.chrome = { runtime: {} };
+"""
+        })
+    except Exception as e:
+        print(f"\tStealth CDP script failed: {e}")
 
 
 def build_chrome_options():
@@ -509,6 +544,9 @@ def build_chrome_options():
     )
     if chrome_bin:
         options.binary_location = chrome_bin
+    user_agent = USER_AGENT or os.environ.get("USER_AGENT") or DEFAULT_USER_AGENT
+    options.add_argument(f"--user-agent={user_agent}")
+    options.add_argument("--lang=en-US")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -516,6 +554,7 @@ def build_chrome_options():
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+    options.add_experimental_option("prefs", {"intl.accept_languages": "en-US,en"})
     if should_use_headless():
         options.add_argument("--headless=new")
     return options
@@ -543,6 +582,7 @@ driver = None
 def init_driver():
     global driver
     driver = create_driver()
+    apply_stealth(driver)
     return driver
 
 

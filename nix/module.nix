@@ -78,7 +78,7 @@ in
 
       path = with pkgs; [
         pkgs.xvfb-run
-        pkgs.xorg.xvfb
+        pkgs.xvfb
       ];
 
       preStart = ''
