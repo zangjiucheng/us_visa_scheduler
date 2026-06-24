@@ -20,6 +20,8 @@ HEADLESS = False
 CHROME_BIN =
 CHROMEDRIVER_PATH =
 USER_AGENT =
+; Stop the service after this many consecutive login failures (0 = unlimited)
+MAX_LOGIN_ATTEMPTS = 3
 ; Optional: HUB_ADDRESS is mandatory only when LOCAL_USE = False
 HUB_ADDRESS = http://localhost:9515/wd/hub
 

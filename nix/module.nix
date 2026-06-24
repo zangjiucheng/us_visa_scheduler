@@ -96,7 +96,7 @@ in
         Group = cfg.group;
         WorkingDirectory = cfg.dataDir;
         ExecStart = "${pkgs.xvfb-run}/bin/xvfb-run -a --server-args='-screen 0 1920x1080x24' ${lib.getExe cfg.package}";
-        Restart = "always";
+        Restart = "on-failure";
         RestartSec = 30;
         Environment = [
           "HOME=${cfg.dataDir}"

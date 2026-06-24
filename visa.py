@@ -3,6 +3,7 @@ import json
 import random
 import re
 import os
+import sys
 import shutil
 import traceback
 import requests
@@ -14,6 +15,7 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait as Wait
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
 
 from embassy import *
 
@@ -78,6 +80,7 @@ HEADLESS = config['CHROMEDRIVER'].getboolean('HEADLESS', fallback=False)
 CHROME_BIN = config['CHROMEDRIVER'].get('CHROME_BIN', '').strip()
 CHROMEDRIVER_PATH = config['CHROMEDRIVER'].get('CHROMEDRIVER_PATH', '').strip()
 USER_AGENT = config['CHROMEDRIVER'].get('USER_AGENT', '').strip()
+MAX_LOGIN_ATTEMPTS = config['CHROMEDRIVER'].getint('MAX_LOGIN_ATTEMPTS', fallback=3)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
@@ -91,13 +94,61 @@ DATE_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/ap
 TIME_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
 SIGN_OUT_LINK = f"https://ais.usvisa-info.com/{EMBASSY}/niv/users/sign_out"
 
-JS_SCRIPT = ("var req = new XMLHttpRequest();"
-             f"req.open('GET', '%s', false);"
-             "req.setRequestHeader('Accept', 'application/json, text/javascript, */*; q=0.01');"
-             "req.setRequestHeader('X-Requested-With', 'XMLHttpRequest');"
-             f"req.setRequestHeader('Cookie', '_yatri_session=%s');"
-             "req.send(null);"
-             "return req.responseText;")
+# Fetch the JSON endpoints from inside the logged-in browser. We use fetch()
+# via execute_async_script instead of a synchronous XMLHttpRequest because a
+# sync XHR aborts with "Failed to execute 'send' on 'XMLHttpRequest': Failed to
+# load ..." (and no status code) when the server drops or redirects the
+# connection after a soft rate-limit. fetch() follows redirects, surfaces the
+# HTTP status, and reports network failures cleanly so we can re-login instead
+# of crash-looping on a dead session. credentials:'include' reuses the
+# browser's own _yatri_session cookie (the appointment page is same-origin).
+JS_FETCH = """
+const url = arguments[0];
+const done = arguments[arguments.length - 1];
+fetch(url, {
+    method: 'GET',
+    credentials: 'include',
+    redirect: 'follow',
+    headers: {
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'X-Requested-With': 'XMLHttpRequest'
+    }
+}).then(r => r.text().then(body => done({
+    status: r.status, redirected: r.redirected, url: r.url, body: body
+}))).catch(err => done({status: 0, error: String(err)}));
+"""
+
+
+class SessionExpired(Exception):
+    """The logged-in session is no longer usable: redirect to sign-in, 401/403,
+    or the connection was dropped (typically a soft rate-limit/ban). The main
+    loop catches this and forces a fresh login."""
+
+
+def fetch_json(url):
+    driver.set_script_timeout(60)
+    try:
+        result = driver.execute_async_script(JS_FETCH, url) or {}
+    except TimeoutException as e:
+        raise SessionExpired(f"Fetch timed out for {url}: {e}") from e
+    status = result.get("status")
+    body = result.get("body") or ""
+    final_url = result.get("url") or ""
+    if not status:
+        # status 0 -> fetch() rejected (connection reset/refused/dropped).
+        raise SessionExpired(f"Network fetch failed for {url}: {result.get('error')}")
+    if result.get("redirected") or status in (301, 302, 303, 401, 403):
+        raise SessionExpired(
+            f"Session expired (HTTP {status}, landed on {final_url}) fetching {url}"
+        )
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        if "sign_in" in final_url or "user_email" in body or body.lstrip()[:1] == "<":
+            raise SessionExpired(f"Logged out — got HTML instead of JSON from {url}")
+        raise RuntimeError(
+            f"Unexpected response (HTTP {status}) when fetching {url}: {body[:500]}"
+        )
 
 appointment_page_ready = False
 scheduling_limit_notified = False
@@ -347,26 +398,21 @@ def reschedule(date):
 def get_date():
     global appointment_page_ready
     ensure_appointment_page_ready()
-    session = driver.get_cookie("_yatri_session")["value"]
-    script = JS_SCRIPT % (str(DATE_URL), session)
-    content = driver.execute_script(script)
     try:
-        return json.loads(content)
-    except json.JSONDecodeError:
+        return fetch_json(DATE_URL)
+    except RuntimeError:
+        # A non-JSON page can mean the scheduling-limit warning re-appeared;
+        # re-prime the appointment page once and retry.
         if is_scheduling_limit_warning():
             appointment_page_ready = False
             ensure_appointment_page_ready()
-            content = driver.execute_script(script)
-            return json.loads(content)
-        raise RuntimeError(f"Unexpected response when fetching dates: {content[:500]}")
+            return fetch_json(DATE_URL)
+        raise
 
 def get_time(date):
     ensure_appointment_page_ready()
     time_url = TIME_URL % date
-    session = driver.get_cookie("_yatri_session")["value"]
-    script = JS_SCRIPT % (str(time_url), session)
-    content = driver.execute_script(script)
-    data = json.loads(content)
+    data = fetch_json(time_url)
     available_times = data.get("available_times") or []
     if not available_times:
         raise RuntimeError(f"No available times for {date}: {data}")
@@ -610,15 +656,30 @@ if __name__ == "__main__":
             total_time = 0
             Req_count = 0
             reset_appointment_page_state()
+            login_attempts = 0
             while True:
                 try:
                     start_process()
                     break
                 except Exception as e:
-                    msg = f"Login failed: {e}\n{traceback.format_exc()}"
+                    login_attempts += 1
+                    msg = f"Login failed ({login_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
                     print(msg)
                     info_logger(LOG_FILE_NAME, msg)
                     send_notification("LOGIN_FAIL", msg[:1900])
+                    if login_attempts >= MAX_LOGIN_ATTEMPTS:
+                        stop_msg = (
+                            f"Login failed {login_attempts} times. "
+                            f"Stopping scheduler — fix config/network and restart the service."
+                        )
+                        print(stop_msg)
+                        info_logger(LOG_FILE_NAME, stop_msg)
+                        send_notification("STOP", stop_msg)
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        sys.exit(0)
                     retry_low = int(RETRY_TIME_L_BOUND)
                     retry_high = int(RETRY_TIME_U_BOUND)
                     if retry_low > retry_high:
@@ -708,6 +769,29 @@ if __name__ == "__main__":
                     print(msg)
                     info_logger(LOG_FILE_NAME, msg)
                     time.sleep(RETRY_WAIT_TIME)
+        except SessionExpired as e:
+            state = "SESSION"
+            detail = str(e)
+            reporter.record(state)
+            reporter.send_first_round_if_needed(Req_count, state, [], [], detail)
+            msg = (
+                f"Session expired/blocked on request #{Req_count}: {e}\n"
+                f"Signing out and re-logging in before the next check."
+            )
+            print(msg)
+            info_logger(LOG_FILE_NAME, msg)
+            send_notification("SESSION", msg[:1900])
+            try:
+                driver.get(SIGN_OUT_LINK)
+            except Exception:
+                pass
+            reset_appointment_page_state()
+            first_loop = True
+            retry_low = int(RETRY_TIME_L_BOUND)
+            retry_high = int(RETRY_TIME_U_BOUND)
+            if retry_low > retry_high:
+                retry_low, retry_high = retry_high, retry_low
+            time.sleep(random.randint(retry_low, retry_high))
         except Exception as e:
             state = "ERROR"
             detail = str(e)
