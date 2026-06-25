@@ -487,6 +487,56 @@ def _reschedule_form_fields():
     }
 
 
+RESCHEDULE_SUCCESS_PHRASES = (
+    "successfully scheduled",
+    "successfully rescheduled",
+    "your appointment has been",
+    "appointment is scheduled",
+)
+RESCHEDULE_FAILURE_PHRASES = (
+    "no longer available",
+    "not available",
+    "please try again",
+    "you must select",
+    "errors prohibited",
+    "could not be",
+)
+
+
+def _response_summary(body):
+    """A short, human-readable slice of a response: surface a flash/alert/notice
+    message if present, else the first bit of visible text. Used so the FAIL/
+    SUCCESS notification shows what the server actually returned."""
+    body = body or ""
+    m = re.search(
+        r'(?:id|class)=["\'][^"\']*(?:flash|alert|notice|error|message)[^"\']*["\'][^>]*>(.*?)<',
+        body, re.I | re.S,
+    )
+    text = m.group(1) if m else body
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:200]
+
+
+def _classify_reschedule_response(r):
+    """Decide whether a reschedule POST went through. Success-banner wording
+    varies by locale, so we bias toward SUCCESS: only call it a failure on a
+    clear signal (HTTP error, bounced to sign-in, or a known error phrase). A
+    false 'fail' is the dangerous case — it keeps the bot re-booking and burning
+    limited reschedule attempts — so when in doubt we stop."""
+    body = r.text or ""
+    low = body.lower()
+    if any(p in low for p in RESCHEDULE_SUCCESS_PHRASES):
+        return True, "success banner"
+    if r.status_code >= 400:
+        return False, f"HTTP {r.status_code}"
+    if "sign_in" in (r.url or "") or "user_email" in low:
+        return False, "bounced to sign-in"
+    for p in RESCHEDULE_FAILURE_PHRASES:
+        if p in low:
+            return False, f"error phrase {p!r}"
+    return True, "no error signal (assumed booked)"
+
+
 def reschedule(date):
     ensure_appointment_page_ready()
     time_slot = get_time(date)
@@ -503,9 +553,11 @@ def reschedule(date):
         "appointments[consulate_appointment][time]": time_slot,
     }
     r = requests.post(APPOINTMENT_URL, headers=headers, cookies=cookies, data=data, timeout=60)
-    if r.text.find('Successfully Scheduled') != -1:
-        return ["SUCCESS", f"Rescheduled Successfully! {date} {time_slot}"]
-    return ["FAIL", f"Reschedule Failed!!! {date} {time_slot} (HTTP {r.status_code})"]
+    ok, reason = _classify_reschedule_response(r)
+    detail = f"(HTTP {r.status_code}; {reason}; resp: {_response_summary(r.text)})"
+    if ok:
+        return ["SUCCESS", f"Rescheduled Successfully! {date} {time_slot} {detail}"]
+    return ["FAIL", f"Reschedule Failed!!! {date} {time_slot} {detail}"]
 
 
 def get_date():
