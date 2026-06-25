@@ -48,6 +48,9 @@ if PERIOD_END_DT <= PERIOD_START_DT:
     raise SystemExit(
         f"PERIOD_END ({PERIOD_END}) must be after PERIOD_START ({PERIOD_START}) in config.ini"
     )
+# When True, automatically reschedule to the earliest date found inside the
+# target window and then stop. When False, only notify (manual reschedule).
+AUTO_RESCHEDULE = config['PERSONAL_INFO'].getboolean('AUTO_RESCHEDULE', fallback=True)
 # Embassy Section:
 YOUR_EMBASSY = config['PERSONAL_INFO']['YOUR_EMBASSY'] 
 EMBASSY = Embassies[YOUR_EMBASSY][0]
@@ -123,21 +126,66 @@ class SessionExpired(Exception):
     loop catches this and forces a fresh login."""
 
 
-def fetch_json(url):
+def _browser_xhr(url):
+    """Fetch via an in-browser synchronous XHR (best WAF evasion: the browser's
+    own TLS fingerprint + cookie jar). Returns {status, url, body} or {status:0}."""
     try:
         raw = driver.execute_script(JS_FETCH, url)
     except Exception as e:
-        raise SessionExpired(f"Script error fetching {url}: {e}") from e
+        return {"status": 0, "error": f"execute_script failed: {e}"}
     try:
-        result = json.loads(raw) if raw else {}
+        return json.loads(raw) if raw else {"status": 0, "error": "empty XHR result"}
     except (json.JSONDecodeError, TypeError):
-        result = {}
+        return {"status": 0, "error": "unparseable XHR result"}
+
+
+def _requests_fetch(url):
+    """Fallback: fetch the same URL with Python requests, reusing EVERY cookie
+    the browser holds (incl. WAF clearance cookies) plus its User-Agent. This is
+    the same auth path reschedule() uses, and it sidesteps in-page restrictions
+    (CSP / cross-origin redirects) that can break the in-browser XHR."""
+    try:
+        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+        headers = {
+            "User-Agent": driver.execute_script("return navigator.userAgent;"),
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": APPOINTMENT_URL,
+        }
+        r = requests.get(url, headers=headers, cookies=cookies, timeout=30)
+        return {"status": r.status_code, "url": r.url, "body": r.text}
+    except Exception as e:
+        return {"status": 0, "error": f"requests fetch failed: {e}"}
+
+
+def _page_diagnostics():
+    try:
+        return (
+            f"url={driver.current_url!r}, title={driver.title!r}, "
+            f"page[:200]={driver.page_source[:200]!r}"
+        )
+    except Exception as e:
+        return f"(diagnostics unavailable: {e})"
+
+
+def fetch_json(url):
+    # Primary path: in-browser XHR. Fallback: Python requests with the browser's
+    # cookies. Either being blocked/reset is reported as a SessionExpired so the
+    # main loop re-logs in; if BOTH fail we attach page diagnostics so the real
+    # cause (WAF block page, captcha, redirect) is visible in the notification.
+    result = _browser_xhr(url)
+    if not result.get("status"):
+        xhr_err = result.get("error")
+        result = _requests_fetch(url)
+        if not result.get("status"):
+            raise SessionExpired(
+                f"Fetch blocked for {url} (xhr: {xhr_err}; "
+                f"requests: {result.get('error')}). {_page_diagnostics()}"
+            )
+        print(f"\t(in-browser XHR blocked, served via requests fallback) — {xhr_err}")
     status = result.get("status")
     body = result.get("body") or ""
     final_url = result.get("url") or ""
-    if not status:
-        # status 0 -> the sync XHR's send() threw (connection reset/dropped).
-        raise SessionExpired(f"Network fetch failed for {url}: {result.get('error')}")
     if status in (301, 302, 303, 401, 403) or "sign_in" in final_url:
         raise SessionExpired(
             f"Session expired (HTTP {status}, landed on {final_url}) fetching {url}"
@@ -718,9 +766,10 @@ if __name__ == "__main__":
                 info_logger(LOG_FILE_NAME, msg)
                 if candidates:
                     state = "IN_PERIOD"
+                    mode = "auto-reschedule" if AUTO_RESCHEDULE else "notify only"
                     detail = (
                         f"Found {len(candidates)} date(s) in period "
-                        f"({PSD.date()} to {PED.date()}). Notify only — no auto reschedule."
+                        f"({PSD.date()} to {PED.date()}). Mode: {mode}."
                     )
                 else:
                     state = "MONITORING"
@@ -728,22 +777,39 @@ if __name__ == "__main__":
                 reporter.record(state, dates=dates, candidates=candidates)
                 reporter.send_first_round_if_needed(Req_count, state, dates, candidates, detail)
                 if candidates:
-                    candidates_key = tuple(candidates)
-                    if candidates_key != last_notified_candidates:
-                        dates_list = ", ".join(candidates)
-                        msg = (
-                            f"Found {len(candidates)} date(s) in target period "
-                            f"({PSD.date()} to {PED.date()}):\n{dates_list}\n"
-                            f"Reschedule manually on the appointment page."
-                        )
-                        print(msg)
-                        info_logger(LOG_FILE_NAME, msg)
-                        send_notification("FOUND", msg)
-                        last_notified_candidates = candidates_key
+                    target_date = min(candidates)
+                    dates_list = ", ".join(candidates)
+                    msg = (
+                        f"Found {len(candidates)} date(s) in target period "
+                        f"({PSD.date()} to {PED.date()}):\n{dates_list}"
+                    )
+                    print(msg)
+                    info_logger(LOG_FILE_NAME, msg)
+                    if AUTO_RESCHEDULE:
+                        reporter.daily["reschedule_attempts"] += 1
+                        print(f"Auto-rescheduling to earliest in-period date: {target_date}")
+                        try:
+                            title, r_msg = reschedule(target_date)
+                        except SessionExpired:
+                            raise
+                        except Exception as e:
+                            title = "FAIL"
+                            r_msg = f"Reschedule attempt for {target_date} errored: {e}"
+                        print(r_msg)
+                        info_logger(LOG_FILE_NAME, r_msg)
+                        send_notification(title, r_msg)
+                        if title == "SUCCESS":
+                            # Booked the earliest in-window slot — stop here.
+                            END_MSG_TITLE = "SUCCESS"
+                            msg = r_msg + "\nStopping — appointment booked."
+                            break
+                        # FAIL: keep monitoring; the date may already be taken.
                     else:
-                        msg = f"Dates in period unchanged ({len(candidates)}), continuing to monitor."
-                        print(msg)
-                        info_logger(LOG_FILE_NAME, msg)
+                        candidates_key = tuple(candidates)
+                        if candidates_key != last_notified_candidates:
+                            notify = msg + "\nReschedule manually on the appointment page."
+                            send_notification("FOUND", notify)
+                            last_notified_candidates = candidates_key
                 else:
                     last_notified_candidates = None
                     msg = f"No available dates between ({PSD.date()}) and ({PED.date()})!"

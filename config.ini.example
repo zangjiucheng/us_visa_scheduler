@@ -10,6 +10,9 @@ PERIOD_START = 2027-10-01
 PERIOD_END = 2027-11-30
 ; Change "en-am-yer", based on your embassy Abbreviation in embassy.py list.
 YOUR_EMBASSY = en-am-yer
+; True  = auto-book the earliest date found inside your window, then stop.
+; False = only notify (you reschedule manually).
+AUTO_RESCHEDULE = True
 
 [CHROMEDRIVER]
 ; Details for the script to control Chrome
