@@ -158,6 +158,24 @@ def _requests_fetch(url):
         return {"status": 0, "error": f"requests fetch failed: {e}"}
 
 
+def _requests_get_html(url):
+    """Like _requests_fetch but asks for an HTML document (no X-Requested-With,
+    HTML Accept) so Rails returns the rendered page rather than a JS/JSON reply.
+    Used to scrape the reschedule form's hidden fields when the browser DOM is
+    unavailable (e.g. the browser is on a WAF block page)."""
+    try:
+        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+        headers = {
+            "User-Agent": driver.execute_script("return navigator.userAgent;"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": APPOINTMENT_URL,
+        }
+        r = requests.get(url, headers=headers, cookies=cookies, timeout=30)
+        return {"status": r.status_code, "url": r.url, "body": r.text}
+    except Exception as e:
+        return {"status": 0, "error": f"requests GET html failed: {e}"}
+
+
 def _page_diagnostics():
     try:
         return (
@@ -417,31 +435,77 @@ def start_process():
     Wait(driver, 90).until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), '" + REGEX_CONTINUE + "')]")))
     print("\n\tlogin successful!\n")
 
+RESCHEDULE_FIELDS = (
+    "utf8",
+    "authenticity_token",
+    "confirmed_limit_message",
+    "use_consulate_appointment_capacity",
+)
+
+
+def _reschedule_form_fields():
+    """Hidden form fields required to POST a reschedule. Prefer the live browser
+    DOM; if the browser can't render the form (e.g. it's on a WAF block page
+    while the JSON endpoints only succeed via the requests fallback), scrape them
+    from the appointment page HTML fetched with the browser's cookies."""
+    try:
+        fields = {n: driver.find_element(By.NAME, n).get_attribute("value")
+                  for n in RESCHEDULE_FIELDS}
+        if fields.get("authenticity_token"):
+            return fields
+    except Exception:
+        pass  # DOM unavailable -> fall back to scraping the HTML.
+
+    result = _requests_get_html(APPOINTMENT_URL)
+    body = result.get("body") or ""
+    if not result.get("status"):
+        raise RuntimeError(
+            f"Could not load appointment form (requests: {result.get('error')}). "
+            f"{_page_diagnostics()}"
+        )
+
+    def hidden(name):
+        m = (re.search(r'name=["\']' + re.escape(name) + r'["\'][^>]*\bvalue=["\']([^"\']*)["\']', body)
+             or re.search(r'\bvalue=["\']([^"\']*)["\'][^>]*name=["\']' + re.escape(name) + r'["\']', body))
+        return m.group(1) if m else None
+
+    token = hidden("authenticity_token")
+    if not token:
+        m = (re.search(r'name=["\']csrf-token["\'][^>]*content=["\']([^"\']+)["\']', body)
+             or re.search(r'content=["\']([^"\']+)["\'][^>]*name=["\']csrf-token["\']', body))
+        token = m.group(1) if m else None
+    if not token:
+        raise RuntimeError(
+            f"No authenticity_token on appointment page (HTTP {result.get('status')}). "
+            f"{_page_diagnostics()}"
+        )
+    return {
+        "utf8": hidden("utf8") or "✓",
+        "authenticity_token": token,
+        "confirmed_limit_message": hidden("confirmed_limit_message") or "1",
+        "use_consulate_appointment_capacity": hidden("use_consulate_appointment_capacity") or "true",
+    }
+
+
 def reschedule(date):
     ensure_appointment_page_ready()
     time_slot = get_time(date)
+    form = _reschedule_form_fields()
+    cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
     headers = {
         "User-Agent": driver.execute_script("return navigator.userAgent;"),
         "Referer": APPOINTMENT_URL,
-        "Cookie": "_yatri_session=" + driver.get_cookie("_yatri_session")["value"]
     }
     data = {
-        "utf8": driver.find_element(by=By.NAME, value='utf8').get_attribute('value'),
-        "authenticity_token": driver.find_element(by=By.NAME, value='authenticity_token').get_attribute('value'),
-        "confirmed_limit_message": driver.find_element(by=By.NAME, value='confirmed_limit_message').get_attribute('value'),
-        "use_consulate_appointment_capacity": driver.find_element(by=By.NAME, value='use_consulate_appointment_capacity').get_attribute('value'),
+        **form,
         "appointments[consulate_appointment][facility_id]": FACILITY_ID,
         "appointments[consulate_appointment][date]": date,
         "appointments[consulate_appointment][time]": time_slot,
     }
-    r = requests.post(APPOINTMENT_URL, headers=headers, data=data)
-    if(r.text.find('Successfully Scheduled') != -1):
-        title = "SUCCESS"
-        msg = f"Rescheduled Successfully! {date} {time_slot}"
-    else:
-        title = "FAIL"
-        msg = f"Reschedule Failed!!! {date} {time_slot}"
-    return [title, msg]
+    r = requests.post(APPOINTMENT_URL, headers=headers, cookies=cookies, data=data, timeout=60)
+    if r.text.find('Successfully Scheduled') != -1:
+        return ["SUCCESS", f"Rescheduled Successfully! {date} {time_slot}"]
+    return ["FAIL", f"Reschedule Failed!!! {date} {time_slot} (HTTP {r.status_code})"]
 
 
 def get_date():
