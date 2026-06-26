@@ -8,6 +8,10 @@ SCHEDULE_ID = 99999999
 ; Target Period (YYYY-MM-DD, must be valid calendar dates):
 PERIOD_START = 2027-10-01
 PERIOD_END = 2027-11-30
+; Dates to skip even if inside the window (never notified or booked). Leave blank
+; for none. Comma-separated; each item is a single day or an inclusive range:
+;   EXCLUDE_DATES = 2027-10-15, 2027-11-01:2027-11-07, 2027-11-25
+EXCLUDE_DATES =
 ; Change "en-am-yer", based on your embassy Abbreviation in embassy.py list.
 YOUR_EMBASSY = en-am-yer
 ; True  = auto-book the earliest date found inside your window, then stop.

@@ -48,6 +48,30 @@ if PERIOD_END_DT <= PERIOD_START_DT:
     raise SystemExit(
         f"PERIOD_END ({PERIOD_END}) must be after PERIOD_START ({PERIOD_START}) in config.ini"
     )
+
+# Dates to skip even when they fall inside the window. Comma-separated; each item
+# is either a single day (YYYY-MM-DD) or an inclusive range (YYYY-MM-DD:YYYY-MM-DD).
+def parse_exclude_dates(value):
+    intervals = []
+    for chunk in (value or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" in chunk:
+            start_s, _, end_s = chunk.partition(":")
+            start = parse_period_date("EXCLUDE_DATES range start", start_s)
+            end = parse_period_date("EXCLUDE_DATES range end", end_s)
+            intervals.append((min(start, end), max(start, end)))
+        else:
+            day = parse_period_date("EXCLUDE_DATES", chunk)
+            intervals.append((day, day))
+    return intervals
+
+EXCLUDED_INTERVALS = parse_exclude_dates(config['PERSONAL_INFO'].get('EXCLUDE_DATES', ''))
+
+def is_excluded_date(dt):
+    return any(start <= dt <= end for start, end in EXCLUDED_INTERVALS)
+
 # When True, automatically reschedule to the earliest date found inside the
 # target window and then stop. When False, only notify (manual reschedule).
 AUTO_RESCHEDULE = config['PERSONAL_INFO'].getboolean('AUTO_RESCHEDULE', fallback=True)
@@ -600,7 +624,7 @@ def get_available_dates(dates):
         if not date:
             continue
         new_date = datetime.strptime(date, "%Y-%m-%d")
-        if PERIOD_END_DT > new_date > PERIOD_START_DT:
+        if PERIOD_END_DT > new_date > PERIOD_START_DT and not is_excluded_date(new_date):
             matches.append(date)
     return matches, PERIOD_START_DT, PERIOD_END_DT
 
