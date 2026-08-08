@@ -543,22 +543,23 @@ def _response_summary(body):
 
 def _classify_reschedule_response(r):
     """Decide whether a reschedule POST went through. Success-banner wording
-    varies by locale, so we bias toward SUCCESS: only call it a failure on a
-    clear signal (HTTP error, bounced to sign-in, or a known error phrase). A
-    false 'fail' is the dangerous case — it keeps the bot re-booking and burning
-    limited reschedule attempts — so when in doubt we stop."""
+    varies by locale, so failures need a clear signal (HTTP error, bounced to
+    sign-in, or a known error phrase). Anything else is UNCERTAIN rather than
+    an assumed success — an unrecognized response must never be trusted enough
+    to stop monitoring, since that's how a real reschedule failure gets
+    silently reported as booked."""
     body = r.text or ""
     low = body.lower()
     if any(p in low for p in RESCHEDULE_SUCCESS_PHRASES):
-        return True, "success banner"
+        return "SUCCESS", "success banner"
     if r.status_code >= 400:
-        return False, f"HTTP {r.status_code}"
+        return "FAIL", f"HTTP {r.status_code}"
     if "sign_in" in (r.url or "") or "user_email" in low:
-        return False, "bounced to sign-in"
+        return "FAIL", "bounced to sign-in"
     for p in RESCHEDULE_FAILURE_PHRASES:
         if p in low:
-            return False, f"error phrase {p!r}"
-    return True, "no error signal (assumed booked)"
+            return "FAIL", f"error phrase {p!r}"
+    return "UNCERTAIN", "no recognizable success/failure signal"
 
 
 def reschedule(date):
@@ -577,10 +578,12 @@ def reschedule(date):
         "appointments[consulate_appointment][time]": time_slot,
     }
     r = requests.post(APPOINTMENT_URL, headers=headers, cookies=cookies, data=data, timeout=60)
-    ok, reason = _classify_reschedule_response(r)
+    status, reason = _classify_reschedule_response(r)
     detail = f"(HTTP {r.status_code}; {reason}; resp: {_response_summary(r.text)})"
-    if ok:
+    if status == "SUCCESS":
         return ["SUCCESS", f"Rescheduled Successfully! {date} {time_slot} {detail}"]
+    if status == "UNCERTAIN":
+        return ["UNCERTAIN", f"Reschedule response unclear — verify manually on the site! {date} {time_slot} {detail}"]
     return ["FAIL", f"Reschedule Failed!!! {date} {time_slot} {detail}"]
 
 
@@ -605,8 +608,11 @@ def get_time(date):
     available_times = data.get("available_times") or []
     if not available_times:
         raise RuntimeError(f"No available times for {date}: {data}")
-    time_slot = available_times[-1]
-    print(f"Got time successfully! {date} {time_slot}")
+    # Don't rely on the API returning times in any particular order — sort
+    # and take the earliest explicitly, matching the "earliest slot" goal.
+    sorted_times = sorted(available_times)
+    time_slot = sorted_times[0]
+    print(f"Got time successfully! {date} {time_slot} (of {len(sorted_times)} available: {', '.join(sorted_times)})")
     return time_slot
 
 
@@ -624,7 +630,7 @@ def get_available_dates(dates):
         if not date:
             continue
         new_date = datetime.strptime(date, "%Y-%m-%d")
-        if PERIOD_END_DT > new_date > PERIOD_START_DT and not is_excluded_date(new_date):
+        if PERIOD_START_DT <= new_date <= PERIOD_END_DT and not is_excluded_date(new_date):
             matches.append(date)
     return matches, PERIOD_START_DT, PERIOD_END_DT
 
@@ -718,7 +724,7 @@ class RunReporter:
         msg = (
             f"First check complete (request #{req_count})\n"
             f"State: {state}\n"
-            f"Target period: {PERIOD_START} to {PERIOD_END} (exclusive)\n"
+            f"Target period: {PERIOD_START} to {PERIOD_END} (inclusive)\n"
             f"Available: {self._summarize_dates(dates)}\n"
             f"In target period: {len(candidates)}\n"
             f"{detail}"
@@ -832,18 +838,49 @@ def reset_driver():
 
 
 if __name__ == "__main__":
-    init_driver()
+    _startup_log = "log_" + str(datetime.now().date()) + ".txt"
+    driver_attempts = 0
+    while True:
+        try:
+            init_driver()
+            break
+        except Exception as e:
+            driver_attempts += 1
+            msg = f"Driver init failed ({driver_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
+            print(msg)
+            info_logger(_startup_log, msg)
+            send_notification("DRIVER_INIT_FAIL", msg[:1900])
+            if driver_attempts >= MAX_LOGIN_ATTEMPTS:
+                stop_msg = (
+                    f"Driver failed to start {driver_attempts} times. "
+                    f"Exiting non-zero — check chromedriver/chromium install."
+                )
+                print(stop_msg)
+                info_logger(_startup_log, stop_msg)
+                send_notification("STOP", stop_msg)
+                sys.exit(1)
+            retry_low = int(RETRY_TIME_L_BOUND)
+            retry_high = int(RETRY_TIME_U_BOUND)
+            if retry_low > retry_high:
+                retry_low, retry_high = retry_high, retry_low
+            time.sleep(random.randint(retry_low, retry_high))
     first_loop = True
     END_MSG_TITLE = "STOP"
     reporter = RunReporter()
     last_notified_candidates = None
+    # t0/total_time/Req_count drive the WORK_LIMIT_TIME anti-ban cooldown.
+    # They must only reset when we deliberately take a cooldown break
+    # (BANNED or WORK_LIMIT below) — never on a plain re-login (e.g.
+    # SessionExpired), or repeated soft blocks would keep zeroing the clock
+    # and the cooldown that's supposed to catch that exact pattern would
+    # never trigger.
+    t0 = time.time()
+    total_time = 0
+    Req_count = 0
     while 1:
         LOG_FILE_NAME = "log_" + str(datetime.now().date()) + ".txt"
         reporter.maybe_send_daily_report()
         if first_loop:
-            t0 = time.time()
-            total_time = 0
-            Req_count = 0
             reset_appointment_page_state()
             login_attempts = 0
             while True:
@@ -859,7 +896,7 @@ if __name__ == "__main__":
                     if login_attempts >= MAX_LOGIN_ATTEMPTS:
                         stop_msg = (
                             f"Login failed {login_attempts} times. "
-                            f"Stopping scheduler — fix config/network and restart the service."
+                            f"Exiting non-zero so systemd restarts the service after a cooldown."
                         )
                         print(stop_msg)
                         info_logger(LOG_FILE_NAME, stop_msg)
@@ -868,7 +905,10 @@ if __name__ == "__main__":
                             driver.quit()
                         except Exception:
                             pass
-                        sys.exit(0)
+                        # Non-zero exit: Restart=on-failure (nix/module.nix)
+                        # only retries on failure — exit(0) reads as "stopped
+                        # on purpose" and the service never comes back.
+                        sys.exit(1)
                     retry_low = int(RETRY_TIME_L_BOUND)
                     retry_high = int(RETRY_TIME_U_BOUND)
                     if retry_low > retry_high:
@@ -893,9 +933,15 @@ if __name__ == "__main__":
                 print(msg)
                 info_logger(LOG_FILE_NAME, msg)
                 send_notification("BAN", msg)
-                driver.get(SIGN_OUT_LINK)
+                try:
+                    driver.get(SIGN_OUT_LINK)
+                except Exception:
+                    pass
                 time.sleep(BAN_COOLDOWN_TIME * hour)
                 first_loop = True
+                t0 = time.time()
+                total_time = 0
+                Req_count = 0
             else:
                 candidates, PSD, PED = get_available_dates(dates)
                 msg = ""
@@ -943,7 +989,9 @@ if __name__ == "__main__":
                             END_MSG_TITLE = "SUCCESS"
                             msg = r_msg + "\nStopping — appointment booked."
                             break
-                        # FAIL: keep monitoring; the date may already be taken.
+                        # FAIL or UNCERTAIN: keep monitoring. An UNCERTAIN
+                        # response needs manual verification, but the bot must
+                        # never silently stop watching on an unrecognized reply.
                     else:
                         candidates_key = tuple(candidates)
                         if candidates_key != last_notified_candidates:
@@ -968,9 +1016,15 @@ if __name__ == "__main__":
                 if total_time > WORK_LIMIT_TIME * hour:
                     reporter.record_rest()
                     send_notification("REST", f"Break-time after {WORK_LIMIT_TIME} hours | Repeated {Req_count} times")
-                    driver.get(SIGN_OUT_LINK)
+                    try:
+                        driver.get(SIGN_OUT_LINK)
+                    except Exception:
+                        pass
                     time.sleep(WORK_COOLDOWN_TIME * hour)
                     first_loop = True
+                    t0 = time.time()
+                    total_time = 0
+                    Req_count = 0
                 else:
                     msg = "Retry Wait Time: "+ str(RETRY_WAIT_TIME)+ " seconds"
                     print(msg)
@@ -1017,7 +1071,17 @@ if __name__ == "__main__":
     print(msg)
     info_logger(LOG_FILE_NAME, msg)
     send_notification(END_MSG_TITLE, msg)
-    driver.get(SIGN_OUT_LINK)
-    if hasattr(driver, "stop_client"):
-        driver.stop_client()
-    driver.quit()
+    try:
+        driver.get(SIGN_OUT_LINK)
+        if hasattr(driver, "stop_client"):
+            driver.stop_client()
+        driver.quit()
+    except Exception as e:
+        # Best-effort cleanup only — must not let a teardown error escape as
+        # an unhandled exception, or systemd's Restart=on-failure would spin
+        # the service back up and re-fire a reschedule for a date we already
+        # booked, burning one of the site's limited scheduling attempts.
+        teardown_msg = f"Post-stop teardown failed (ignored): {e}"
+        print(teardown_msg)
+        info_logger(LOG_FILE_NAME, teardown_msg)
+    sys.exit(0)
