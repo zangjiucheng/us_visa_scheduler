@@ -68,6 +68,12 @@ in
       "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} -"
       "d ${cfg.dataDir}/logs 0750 ${cfg.user} ${cfg.group} -"
       "d ${cfg.dataDir}/.cache 0750 ${cfg.user} ${cfg.group} -"
+      # configFile is a plain file the admin drops outside the Nix store, so
+      # Nix can't own it directly — reset its owner/mode on every activation
+      # so it's never left world-readable (real credentials live in it). The
+      # trailing "z" line only touches a path that already exists, so this is
+      # a no-op if configFile hasn't been created yet.
+      "z ${cfg.configFile} 0640 root ${cfg.group} -"
     ];
 
     systemd.services.us-visa-scheduler = {
@@ -105,6 +111,31 @@ in
           "CHROMEDRIVER_PATH=${lib.getExe pkgs.chromedriver}"
           "SE_OFFLINE=true"
         ];
+
+        # Sandboxing. Kept conservative because this runs a real Chromium
+        # under Xvfb (Selenium-driven, --no-sandbox --disable-gpu already
+        # set in visa.py): no SystemCallFilter/MemoryDenyWriteExecute/
+        # RestrictNamespaces here, since Chromium's own process model can
+        # need syscalls or W^X pages those would block. Re-test after
+        # enabling — if the unit fails to start, this block is the first
+        # place to loosen.
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        ReadWritePaths = [ cfg.dataDir ];
+        PrivateTmp = true;
+        PrivateDevices = true; # safe: --disable-gpu means no /dev/dri needed
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";
+        RestrictSUIDSGID = true;
+        RestrictRealtime = true;
+        LockPersonality = true;
+        UMask = "0027";
       };
     };
   };
