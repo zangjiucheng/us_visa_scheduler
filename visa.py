@@ -837,15 +837,71 @@ def reset_driver():
     return init_driver()
 
 
+# When MAX_LOGIN_ATTEMPTS is exhausted and every single attempt failed with
+# the browser's ERR_CONNECTION_REFUSED (the site's own backend refusing the
+# TCP connection — not something wrong here), retrying at systemd's fixed
+# RestartSec just hammers a backend that's already down and spams Discord
+# every couple minutes. Persist a counter across process restarts (systemd
+# starts a fresh Python process each time) and sleep progressively longer
+# before exiting so the crash loop backs off instead of firing at a fixed
+# cadence. Any successful driver init/login resets it back to 0.
+CONNECTION_REFUSED_MARKER = "ERR_CONNECTION_REFUSED"
+CONNECTION_BACKOFF_STATE_FILE = "connection_backoff_state.json"
+CONNECTION_BACKOFF_BASE_SECONDS = 60
+CONNECTION_BACKOFF_MAX_SECONDS = 3600
+
+
+def load_connection_backoff_state():
+    try:
+        with open(CONNECTION_BACKOFF_STATE_FILE) as f:
+            return json.load(f).get("consecutive_refused_exhaustions", 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def save_connection_backoff_state(count):
+    try:
+        with open(CONNECTION_BACKOFF_STATE_FILE, "w") as f:
+            json.dump({"consecutive_refused_exhaustions": count}, f)
+    except OSError:
+        pass
+
+
+def exit_with_connection_backoff(errors, stop_msg, log_file):
+    if errors and all(CONNECTION_REFUSED_MARKER in str(e) for e in errors):
+        level = load_connection_backoff_state() + 1
+        save_connection_backoff_state(level)
+        backoff_s = min(
+            CONNECTION_BACKOFF_BASE_SECONDS * (2 ** (level - 1)),
+            CONNECTION_BACKOFF_MAX_SECONDS,
+        )
+        stop_msg = (
+            f"{stop_msg} All {len(errors)} attempts were {CONNECTION_REFUSED_MARKER} "
+            f"(the site's backend, not us) — sleeping {backoff_s}s before exit "
+            f"(backoff level {level})."
+        )
+        print(stop_msg)
+        info_logger(log_file, stop_msg)
+        send_notification("STOP", stop_msg)
+        time.sleep(backoff_s)
+    else:
+        save_connection_backoff_state(0)
+        send_notification("STOP", stop_msg)
+    sys.exit(1)
+
+
 if __name__ == "__main__":
     _startup_log = "log_" + str(datetime.now().date()) + ".txt"
     driver_attempts = 0
+    driver_attempt_errors = []
     while True:
         try:
             init_driver()
+            save_connection_backoff_state(0)
             break
         except Exception as e:
             driver_attempts += 1
+            driver_attempt_errors.append(e)
             msg = f"Driver init failed ({driver_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
             print(msg)
             info_logger(_startup_log, msg)
@@ -857,8 +913,7 @@ if __name__ == "__main__":
                 )
                 print(stop_msg)
                 info_logger(_startup_log, stop_msg)
-                send_notification("STOP", stop_msg)
-                sys.exit(1)
+                exit_with_connection_backoff(driver_attempt_errors, stop_msg, _startup_log)
             retry_low = int(RETRY_TIME_L_BOUND)
             retry_high = int(RETRY_TIME_U_BOUND)
             if retry_low > retry_high:
@@ -883,12 +938,15 @@ if __name__ == "__main__":
         if first_loop:
             reset_appointment_page_state()
             login_attempts = 0
+            login_attempt_errors = []
             while True:
                 try:
                     start_process()
+                    save_connection_backoff_state(0)
                     break
                 except Exception as e:
                     login_attempts += 1
+                    login_attempt_errors.append(e)
                     msg = f"Login failed ({login_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
                     print(msg)
                     info_logger(LOG_FILE_NAME, msg)
@@ -900,7 +958,6 @@ if __name__ == "__main__":
                         )
                         print(stop_msg)
                         info_logger(LOG_FILE_NAME, stop_msg)
-                        send_notification("STOP", stop_msg)
                         try:
                             driver.quit()
                         except Exception:
@@ -908,7 +965,7 @@ if __name__ == "__main__":
                         # Non-zero exit: Restart=on-failure (nix/module.nix)
                         # only retries on failure — exit(0) reads as "stopped
                         # on purpose" and the service never comes back.
-                        sys.exit(1)
+                        exit_with_connection_backoff(login_attempt_errors, stop_msg, LOG_FILE_NAME)
                     retry_low = int(RETRY_TIME_L_BOUND)
                     retry_high = int(RETRY_TIME_U_BOUND)
                     if retry_low > retry_high:
