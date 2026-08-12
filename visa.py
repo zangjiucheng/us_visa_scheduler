@@ -844,7 +844,8 @@ def reset_driver():
 # every couple minutes. Persist a counter across process restarts (systemd
 # starts a fresh Python process each time) and sleep progressively longer
 # before exiting so the crash loop backs off instead of firing at a fixed
-# cadence. Any successful driver init/login resets it back to 0.
+# cadence. Only a successful login resets it — driver init succeeding says
+# nothing about the target site being reachable, since it never talks to it.
 CONNECTION_REFUSED_MARKER = "ERR_CONNECTION_REFUSED"
 CONNECTION_BACKOFF_STATE_FILE = "connection_backoff_state.json"
 CONNECTION_BACKOFF_BASE_SECONDS = 60
@@ -897,7 +898,6 @@ if __name__ == "__main__":
     while True:
         try:
             init_driver()
-            save_connection_backoff_state(0)
             break
         except Exception as e:
             driver_attempts += 1
