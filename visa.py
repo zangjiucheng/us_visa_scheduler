@@ -844,8 +844,12 @@ def reset_driver():
 # every couple minutes. Persist a counter across process restarts (systemd
 # starts a fresh Python process each time) and sleep progressively longer
 # before exiting so the crash loop backs off instead of firing at a fixed
-# cadence. Only a successful login resets it — driver init succeeding says
+# cadence. Only a successful login touches it — driver init succeeding says
 # nothing about the target site being reachable, since it never talks to it.
+# The site has been observed flapping (briefly reachable, then refusing
+# again), so a single success only halves the level instead of zeroing it —
+# otherwise one lucky login throws away the whole ladder and every cycle
+# restarts from the noisy 60s floor.
 CONNECTION_REFUSED_MARKER = "ERR_CONNECTION_REFUSED"
 CONNECTION_BACKOFF_STATE_FILE = "connection_backoff_state.json"
 CONNECTION_BACKOFF_BASE_SECONDS = 60
@@ -866,6 +870,10 @@ def save_connection_backoff_state(count):
             json.dump({"consecutive_refused_exhaustions": count}, f)
     except OSError:
         pass
+
+
+def decay_connection_backoff_state():
+    save_connection_backoff_state(load_connection_backoff_state() // 2)
 
 
 def exit_with_connection_backoff(errors, stop_msg, log_file):
@@ -905,7 +913,11 @@ if __name__ == "__main__":
             msg = f"Driver init failed ({driver_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
             print(msg)
             info_logger(_startup_log, msg)
-            send_notification("DRIVER_INIT_FAIL", msg[:1900])
+            # ERR_CONNECTION_REFUSED attempts get one summary via the STOP
+            # notification below (exit_with_connection_backoff) instead of
+            # one Discord message per attempt — same failure, no new info.
+            if CONNECTION_REFUSED_MARKER not in str(e):
+                send_notification("DRIVER_INIT_FAIL", msg[:1900])
             if driver_attempts >= MAX_LOGIN_ATTEMPTS:
                 stop_msg = (
                     f"Driver failed to start {driver_attempts} times. "
@@ -942,7 +954,7 @@ if __name__ == "__main__":
             while True:
                 try:
                     start_process()
-                    save_connection_backoff_state(0)
+                    decay_connection_backoff_state()
                     break
                 except Exception as e:
                     login_attempts += 1
@@ -950,7 +962,11 @@ if __name__ == "__main__":
                     msg = f"Login failed ({login_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
                     print(msg)
                     info_logger(LOG_FILE_NAME, msg)
-                    send_notification("LOGIN_FAIL", msg[:1900])
+                    # Same rationale as the driver-init loop above: skip the
+                    # per-attempt Discord ping for ERR_CONNECTION_REFUSED,
+                    # the STOP notification already summarizes the cycle.
+                    if CONNECTION_REFUSED_MARKER not in str(e):
+                        send_notification("LOGIN_FAIL", msg[:1900])
                     if login_attempts >= MAX_LOGIN_ATTEMPTS:
                         stop_msg = (
                             f"Login failed {login_attempts} times. "
