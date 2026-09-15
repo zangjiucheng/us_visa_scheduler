@@ -1,14 +1,21 @@
-import time
+"""US VISA (usvisa-info.com) appointment rescheduler."""
+
+import argparse
+import configparser
 import json
+import logging
+import logging.handlers
+import os
 import random
 import re
-import os
-import sys
 import shutil
+import sys
+import time
 import traceback
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import requests
-import configparser
-from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -18,19 +25,89 @@ from selenium.webdriver.common.by import By
 
 from embassy import *
 
+log = logging.getLogger("visa")
+
+
+def _parse_cli_args():
+    # parse_known_args (not parse_args) so importing this module from a test or
+    # another script never dies on argv that isn't meant for us.
+    parser = argparse.ArgumentParser(description="US visa appointment rescheduler")
+    parser.add_argument("--config", help="path to config.ini (default: $VISA_CONFIG, ./config.ini, or next to visa.py)")
+    parser.add_argument("--check-config", action="store_true", help="validate the config, print the effective settings, and exit")
+    args, _unknown = parser.parse_known_args()
+    return args
+
+
+CLI_ARGS = _parse_cli_args()
+
+
+def resolve_config_path(explicit=None):
+    """First existing config among: --config, $VISA_CONFIG, ./config.ini, and
+    the copy next to visa.py. The last one matters because the service may be
+    started from a different working directory than the checkout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        explicit,
+        os.environ.get("VISA_CONFIG"),
+        os.path.join(os.getcwd(), "config.ini"),
+        os.path.join(here, "config.ini"),
+    ]
+    tried = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = os.path.abspath(os.path.expanduser(candidate))
+        if path in tried:
+            continue
+        tried.append(path)
+        if os.path.isfile(path):
+            return path
+    raise SystemExit(
+        "No config.ini found. Tried:\n  " + "\n  ".join(tried) +
+        "\nCopy config.ini.example, fill it in, and pass --config (or set VISA_CONFIG) if it lives elsewhere."
+    )
+
+
+CONFIG_PATH = resolve_config_path(CLI_ARGS.config)
 config = configparser.ConfigParser()
-config.read('config.ini')
+# configparser.read() silently ignores a file it cannot open, which used to
+# surface much later as a bare KeyError on a section. Open it ourselves so a
+# wrong path or a syntax error fails loudly, at startup, with the path in it.
+with open(CONFIG_PATH, encoding="utf-8") as _config_file:
+    config.read_file(_config_file, source=CONFIG_PATH)
+
+
+def require(section, key):
+    try:
+        value = config[section][key]
+    except KeyError:
+        raise SystemExit(f"Missing [{section}] {key} in {CONFIG_PATH} (see config.ini.example)") from None
+    if not value.strip():
+        raise SystemExit(f"Empty [{section}] {key} in {CONFIG_PATH} (see config.ini.example)")
+    return value.strip()
+
+
+def require_float(section, key, minimum=None):
+    raw = require(section, key)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(f"[{section}] {key} must be a number, got {raw!r} in {CONFIG_PATH}") from None
+    if minimum is not None and value < minimum:
+        raise SystemExit(f"[{section}] {key} must be >= {minimum}, got {value} in {CONFIG_PATH}")
+    return value
+
 
 # Personal Info:
 # Account and current appointment info from https://ais.usvisa-info.com
-USERNAME = config['PERSONAL_INFO']['USERNAME']
-PASSWORD = config['PERSONAL_INFO']['PASSWORD']
+USERNAME = require('PERSONAL_INFO', 'USERNAME')
+PASSWORD = require('PERSONAL_INFO', 'PASSWORD')
 # Find SCHEDULE_ID in re-schedule page link:
 # https://ais.usvisa-info.com/en-am/niv/schedule/{SCHEDULE_ID}/appointment
-SCHEDULE_ID = config['PERSONAL_INFO']['SCHEDULE_ID']
+SCHEDULE_ID = require('PERSONAL_INFO', 'SCHEDULE_ID')
 # Target Period:
-PERIOD_START = config['PERSONAL_INFO']['PERIOD_START']
-PERIOD_END = config['PERSONAL_INFO']['PERIOD_END']
+PERIOD_START = require('PERSONAL_INFO', 'PERIOD_START')
+PERIOD_END = require('PERSONAL_INFO', 'PERIOD_END')
 
 def parse_period_date(field_name, value):
     value = value.strip()
@@ -75,15 +152,26 @@ def is_excluded_date(dt):
 # When True, automatically reschedule to the earliest date found inside the
 # target window and then stop. When False, only notify (manual reschedule).
 AUTO_RESCHEDULE = config['PERSONAL_INFO'].getboolean('AUTO_RESCHEDULE', fallback=True)
+# Safety rail: never move the appointment to a date at or after the one already
+# on the account. A wide target window can otherwise contain dates that are
+# *worse* than what you hold, and the site charges a reschedule attempt for it.
+ONLY_EARLIER = config['PERSONAL_INFO'].getboolean('ONLY_EARLIER', fallback=True)
+# The site allows a limited number of reschedules; stop auto-booking after this
+# many attempts from one process (0 = unlimited) and fall back to notify-only.
+MAX_RESCHEDULE_ATTEMPTS = config['PERSONAL_INFO'].getint('MAX_RESCHEDULE_ATTEMPTS', fallback=6)
 # Embassy Section:
-YOUR_EMBASSY = config['PERSONAL_INFO']['YOUR_EMBASSY'] 
-EMBASSY = Embassies[YOUR_EMBASSY][0]
-FACILITY_ID = Embassies[YOUR_EMBASSY][1]
-REGEX_CONTINUE = Embassies[YOUR_EMBASSY][2]
+YOUR_EMBASSY = require('PERSONAL_INFO', 'YOUR_EMBASSY')
+try:
+    EMBASSY, FACILITY_ID, REGEX_CONTINUE = Embassies[YOUR_EMBASSY]
+except KeyError:
+    raise SystemExit(
+        f"Unknown YOUR_EMBASSY {YOUR_EMBASSY!r} in {CONFIG_PATH}. "
+        f"Known codes: {', '.join(sorted(Embassies))}"
+    ) from None
 
 # Notification via Discord bot (https://discord.com/developers/applications)
-DISCORD_BOT_TOKEN = config['NOTIFICATION']['DISCORD_BOT_TOKEN']
-DISCORD_CHANNEL_ID = config['NOTIFICATION']['DISCORD_CHANNEL_ID']
+DISCORD_BOT_TOKEN = config['NOTIFICATION'].get('DISCORD_BOT_TOKEN', '').strip()
+DISCORD_CHANNEL_ID = config['NOTIFICATION'].get('DISCORD_CHANNEL_ID', '').strip()
 
 # Time Section:
 minute = 60
@@ -91,34 +179,173 @@ hour = 60 * minute
 # Time between steps (interactions with forms)
 STEP_TIME = 0.5
 # Time between retries/checks for available dates (seconds)
-RETRY_TIME_L_BOUND = config['TIME'].getfloat('RETRY_TIME_L_BOUND')
-RETRY_TIME_U_BOUND = config['TIME'].getfloat('RETRY_TIME_U_BOUND')
+RETRY_TIME_L_BOUND = require_float('TIME', 'RETRY_TIME_L_BOUND', minimum=1)
+RETRY_TIME_U_BOUND = require_float('TIME', 'RETRY_TIME_U_BOUND', minimum=1)
 # Cooling down after WORK_LIMIT_TIME hours of work (Avoiding Ban)
-WORK_LIMIT_TIME = config['TIME'].getfloat('WORK_LIMIT_TIME')
-WORK_COOLDOWN_TIME = config['TIME'].getfloat('WORK_COOLDOWN_TIME')
+WORK_LIMIT_TIME = require_float('TIME', 'WORK_LIMIT_TIME', minimum=0)
+WORK_COOLDOWN_TIME = require_float('TIME', 'WORK_COOLDOWN_TIME', minimum=0)
 # Temporary Banned (empty list): wait COOLDOWN_TIME hours
-BAN_COOLDOWN_TIME = config['TIME'].getfloat('BAN_COOLDOWN_TIME')
+BAN_COOLDOWN_TIME = require_float('TIME', 'BAN_COOLDOWN_TIME', minimum=0)
+# Don't re-attempt the same date for this many minutes after a failed booking:
+# the site counts every attempt, and a date that just failed is usually gone.
+RESCHEDULE_RETRY_COOLDOWN = config.getfloat('TIME', 'RESCHEDULE_RETRY_COOLDOWN', fallback=20)
+# Repeated identical error notifications are collapsed within this many minutes
+# (0 disables the throttle). Booking-relevant titles are never throttled.
+NOTIFY_MIN_INTERVAL = config.getfloat('TIME', 'NOTIFY_MIN_INTERVAL', fallback=15)
+# Poll a bit faster right after the available-date list changes, drifting back
+# to the configured upper bound while nothing moves. Never polls slower than
+# RETRY_TIME_U_BOUND nor faster than RETRY_TIME_L_BOUND.
+ADAPTIVE_PACING = config.getboolean('TIME', 'ADAPTIVE_PACING', fallback=True)
+ADAPTIVE_RAMP_POLLS = config.getint('TIME', 'ADAPTIVE_RAMP_POLLS', fallback=10)
+# auto  = decide per response whether an empty list is a soft ban or simply no
+#         open days (see empty_list_looks_like_ban)
+# ban   = always treat an empty list as a ban and sleep BAN_COOLDOWN_TIME
+# retry = never treat it as a ban, just keep polling
+EMPTY_LIST_POLICY = config.get('TIME', 'EMPTY_LIST_POLICY', fallback='auto').strip().lower()
+if EMPTY_LIST_POLICY not in ("auto", "ban", "retry"):
+    raise SystemExit(f"[TIME] EMPTY_LIST_POLICY must be auto, ban or retry — got {EMPTY_LIST_POLICY!r}")
+
+
+def _load_timezone(name):
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception as e:
+        raise SystemExit(
+            f"[TIME] TIMEZONE {name!r} is not a known IANA zone (e.g. America/Toronto): {e}"
+        ) from e
+
+
+# All scheduling decisions (active window, daily report boundary) use this zone,
+# so a server running in UTC still lines up with the consulate's local clock.
+TIMEZONE = config.get('TIME', 'TIMEZONE', fallback='').strip()
+TZ = _load_timezone(TIMEZONE)
+
+
+def now():
+    return datetime.now(TZ)
+
+
+def _parse_hhmm(value):
+    try:
+        hh, _, mm = value.strip().partition(":")
+        hh, mm = int(hh), int(mm or 0)
+        if not (0 <= hh <= 24 and 0 <= mm < 60):
+            raise ValueError
+        return hh * 60 + mm
+    except ValueError:
+        raise SystemExit(
+            f"[TIME] ACTIVE_HOURS entries must look like HH:MM-HH:MM — got {value!r}"
+        ) from None
+
+
+def parse_active_hours(value):
+    """Minutes-since-midnight ranges the bot is allowed to poll in. Empty means
+    around the clock. A range whose end is <= its start wraps past midnight."""
+    ranges = []
+    for chunk in (value or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        start_s, sep, end_s = chunk.partition("-")
+        if not sep:
+            raise SystemExit(f"[TIME] ACTIVE_HOURS entry {chunk!r} is missing the '-' separator")
+        start, end = _parse_hhmm(start_s), _parse_hhmm(end_s)
+        if start == end:
+            raise SystemExit(f"[TIME] ACTIVE_HOURS entry {chunk!r} is an empty range")
+        ranges.append((start, end))
+    return ranges
+
+
+ACTIVE_HOURS = config.get('TIME', 'ACTIVE_HOURS', fallback='').strip()
+ACTIVE_RANGES = parse_active_hours(ACTIVE_HOURS)
+
+
+def in_active_window(moment=None):
+    if not ACTIVE_RANGES:
+        return True
+    moment = moment or now()
+    minutes = moment.hour * 60 + moment.minute
+    for start, end in ACTIVE_RANGES:
+        if start < end:
+            if start <= minutes < end:
+                return True
+        elif minutes >= start or minutes < end:  # wraps past midnight
+            return True
+    return False
+
+
+def seconds_until_active(moment=None):
+    """Seconds to wait until the next active window opens (0 if open now)."""
+    if not ACTIVE_RANGES or in_active_window(moment):
+        return 0
+    moment = moment or now()
+    midnight = moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    waits = []
+    for start, _end in ACTIVE_RANGES:
+        candidate = midnight + timedelta(minutes=start)
+        if candidate <= moment:
+            candidate += timedelta(days=1)
+        waits.append((candidate - moment).total_seconds())
+    return max(0, int(min(waits)))
+
+
+# Logging Section:
+LOG_DIR = config.get('LOGGING', 'LOG_DIR', fallback='logs').strip() or 'logs'
+LOG_RETENTION_DAYS = config.getint('LOGGING', 'LOG_RETENTION_DAYS', fallback=14)
+DEBUG_ARTIFACT_LIMIT = config.getint('LOGGING', 'DEBUG_ARTIFACT_LIMIT', fallback=20)
+DEBUG_DIR = os.path.join(LOG_DIR, "debug")
 
 # CHROMEDRIVER
 # Details for the script to control Chrome
-LOCAL_USE = config['CHROMEDRIVER'].getboolean('LOCAL_USE')
-HEADLESS = config['CHROMEDRIVER'].getboolean('HEADLESS', fallback=False)
-CHROME_BIN = config['CHROMEDRIVER'].get('CHROME_BIN', '').strip()
-CHROMEDRIVER_PATH = config['CHROMEDRIVER'].get('CHROMEDRIVER_PATH', '').strip()
-USER_AGENT = config['CHROMEDRIVER'].get('USER_AGENT', '').strip()
-MAX_LOGIN_ATTEMPTS = config['CHROMEDRIVER'].getint('MAX_LOGIN_ATTEMPTS', fallback=3)
+LOCAL_USE = config.getboolean('CHROMEDRIVER', 'LOCAL_USE', fallback=True)
+HEADLESS = config.getboolean('CHROMEDRIVER', 'HEADLESS', fallback=False)
+CHROME_BIN = config.get('CHROMEDRIVER', 'CHROME_BIN', fallback='').strip()
+CHROMEDRIVER_PATH = config.get('CHROMEDRIVER', 'CHROMEDRIVER_PATH', fallback='').strip()
+USER_AGENT = config.get('CHROMEDRIVER', 'USER_AGENT', fallback='').strip()
+MAX_LOGIN_ATTEMPTS = config.getint('CHROMEDRIVER', 'MAX_LOGIN_ATTEMPTS', fallback=3)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
 # Optional: HUB_ADDRESS is mandatory only when LOCAL_USE = False
-HUB_ADDRESS = config['CHROMEDRIVER']['HUB_ADDRESS']
+HUB_ADDRESS = config.get('CHROMEDRIVER', 'HUB_ADDRESS', fallback='').strip()
+if not LOCAL_USE and not HUB_ADDRESS:
+    raise SystemExit("[CHROMEDRIVER] HUB_ADDRESS is required when LOCAL_USE = False")
 
 SIGN_IN_LINK = f"https://ais.usvisa-info.com/{EMBASSY}/niv/users/sign_in"
 APPOINTMENT_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment"
 DATE_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/days/{FACILITY_ID}.json?appointments[expedite]=false"
 TIME_URL = f"https://ais.usvisa-info.com/{EMBASSY}/niv/schedule/{SCHEDULE_ID}/appointment/times/{FACILITY_ID}.json?date=%s&appointments[expedite]=false"
 SIGN_OUT_LINK = f"https://ais.usvisa-info.com/{EMBASSY}/niv/users/sign_out"
+
+
+def setup_logging():
+    """One stream for stdout (journald picks it up) and one rotating daily file
+    under LOG_DIR, pruned to LOG_RETENTION_DAYS. Replaces the old print() +
+    info_logger() double-write, which grew one unbounded file per day."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    handlers = [logging.StreamHandler(sys.stdout)]
+    try:
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            os.path.join(LOG_DIR, "visa.log"), when="midnight",
+            backupCount=max(1, LOG_RETENTION_DAYS), encoding="utf-8",
+        )
+        file_handler.suffix = "%Y-%m-%d"
+        handlers.append(file_handler)
+    except OSError as e:
+        print(f"Could not open the log file in {LOG_DIR!r}, logging to stdout only: {e}")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    # Selenium/urllib3 are chatty at INFO and would drown the scheduler's own log.
+    logging.getLogger("selenium").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 
 # Fetch the JSON endpoints from inside the logged-in browser with a *synchronous*
 # XMLHttpRequest — the same technique the site's own front-end uses, and the only
@@ -150,6 +377,63 @@ class SessionExpired(Exception):
     loop catches this and forces a fresh login."""
 
 
+# Titles that always go out: they are the ones you act on. Everything else
+# (ERROR/SESSION/LOGIN_FAIL/...) is collapsed when it repeats verbatim, so a
+# flapping site can't turn into one Discord message per retry.
+ALWAYS_NOTIFY_TITLES = {"SUCCESS", "FOUND", "UNCERTAIN", "LIMIT", "STOP", "DAILY", "STATUS", "REST", "BAN"}
+_notify_history = {}
+
+
+def _notification_fingerprint(title, msg):
+    # Digits change every message (counts, timestamps, request ids) but say
+    # nothing about *which* failure this is — blank them out before comparing.
+    return title, re.sub(r"\d+", "#", msg)[:200]
+
+
+def _notification_suppressed(title, msg):
+    """True when this message repeats one sent less than NOTIFY_MIN_INTERVAL
+    minutes ago. Bumps the suppressed counter so the next one that gets through
+    can say how many were swallowed."""
+    if NOTIFY_MIN_INTERVAL <= 0 or title in ALWAYS_NOTIFY_TITLES:
+        return False, 0
+    key = _notification_fingerprint(title, msg)
+    last_sent, suppressed = _notify_history.get(key, (0.0, 0))
+    if time.time() - last_sent < NOTIFY_MIN_INTERVAL * minute:
+        _notify_history[key] = (last_sent, suppressed + 1)
+        return True, suppressed + 1
+    _notify_history[key] = (time.time(), 0)
+    return False, suppressed
+
+
+def send_notification(title, msg):
+    suppressed_now, suppressed_count = _notification_suppressed(title, msg)
+    if suppressed_now:
+        log.info(f"Notification '{title}' suppressed (repeat #{suppressed_count} within {NOTIFY_MIN_INTERVAL:g} min)")
+        return
+    log.info("Sending notification!")
+    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
+        log.info("Discord not configured, skipping notification.")
+        return
+
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    if suppressed_count:
+        msg = f"{msg}\n(+{suppressed_count} identical message(s) suppressed since the last one)"
+    content = f"**VISA - {title}**\n{msg}"
+    if len(content) > 2000:
+        content = content[:1997] + "..."
+
+    try:
+        response = requests.post(url, headers=headers, json={"content": content}, timeout=30)
+        response.raise_for_status()
+        log.info("Discord notification sent.")
+    except requests.RequestException as e:
+        log.warning(f"Discord notification failed: {e}")
+
+
 def _browser_xhr(url):
     """Fetch via an in-browser synchronous XHR (best WAF evasion: the browser's
     own TLS fingerprint + cookie jar). Returns {status, url, body} or {status:0}."""
@@ -163,20 +447,30 @@ def _browser_xhr(url):
         return {"status": 0, "error": "unparseable XHR result"}
 
 
+def _browser_cookies():
+    return {c["name"]: c["value"] for c in driver.get_cookies()}
+
+
+def _browser_user_agent():
+    try:
+        return driver.execute_script("return navigator.userAgent;")
+    except Exception:
+        return USER_AGENT or DEFAULT_USER_AGENT
+
+
 def _requests_fetch(url):
     """Fallback: fetch the same URL with Python requests, reusing EVERY cookie
     the browser holds (incl. WAF clearance cookies) plus its User-Agent. This is
     the same auth path reschedule() uses, and it sidesteps in-page restrictions
     (CSP / cross-origin redirects) that can break the in-browser XHR."""
     try:
-        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
         headers = {
-            "User-Agent": driver.execute_script("return navigator.userAgent;"),
+            "User-Agent": _browser_user_agent(),
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With": "XMLHttpRequest",
             "Referer": APPOINTMENT_URL,
         }
-        r = requests.get(url, headers=headers, cookies=cookies, timeout=30)
+        r = requests.get(url, headers=headers, cookies=_browser_cookies(), timeout=30)
         return {"status": r.status_code, "url": r.url, "body": r.text}
     except Exception as e:
         return {"status": 0, "error": f"requests fetch failed: {e}"}
@@ -188,13 +482,12 @@ def _requests_get_html(url):
     Used to scrape the reschedule form's hidden fields when the browser DOM is
     unavailable (e.g. the browser is on a WAF block page)."""
     try:
-        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
         headers = {
-            "User-Agent": driver.execute_script("return navigator.userAgent;"),
+            "User-Agent": _browser_user_agent(),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Referer": APPOINTMENT_URL,
         }
-        r = requests.get(url, headers=headers, cookies=cookies, timeout=30)
+        r = requests.get(url, headers=headers, cookies=_browser_cookies(), timeout=30)
         return {"status": r.status_code, "url": r.url, "body": r.text}
     except Exception as e:
         return {"status": 0, "error": f"requests GET html failed: {e}"}
@@ -208,6 +501,22 @@ def _page_diagnostics():
         )
     except Exception as e:
         return f"(diagnostics unavailable: {e})"
+
+
+def _page_text(limit=4000):
+    """Visible text of the current page, read inside the browser. Cheaper than
+    driver.page_source, which serializes the whole DOM across the wire — this
+    runs on every poll, so the difference adds up."""
+    try:
+        text = driver.execute_script(
+            "return document.body ? document.body.innerText : '';"
+        ) or ""
+        return text[:limit]
+    except Exception:
+        try:
+            return driver.page_source[:limit]
+        except Exception:
+            return ""
 
 
 def fetch_json(url):
@@ -224,7 +533,7 @@ def fetch_json(url):
                 f"Fetch blocked for {url} (xhr: {xhr_err}; "
                 f"requests: {result.get('error')}). {_page_diagnostics()}"
             )
-        print(f"\t(in-browser XHR blocked, served via requests fallback) — {xhr_err}")
+        log.info(f"\t(in-browser XHR blocked, served via requests fallback) — {xhr_err}")
     status = result.get("status")
     body = result.get("body") or ""
     final_url = result.get("url") or ""
@@ -243,6 +552,13 @@ def fetch_json(url):
 
 appointment_page_ready = False
 scheduling_limit_notified = False
+auto_reschedule_enabled = AUTO_RESCHEDULE
+reschedule_attempts_used = 0
+# What the site itself last told us is left ("You have N remaining attempt"),
+# which is authoritative and usually lower than MAX_RESCHEDULE_ATTEMPTS.
+site_remaining_attempts = None
+# date string -> unix ts of the last failed attempt, for RESCHEDULE_RETRY_COOLDOWN
+failed_targets = {}
 
 
 def reset_appointment_page_state():
@@ -252,7 +568,7 @@ def reset_appointment_page_state():
 
 
 def is_scheduling_limit_warning():
-    return "Scheduling Limit Warning" in driver.page_source
+    return "Scheduling Limit Warning" in _page_text()
 
 
 def _acknowledge_scheduling_limit_checkbox():
@@ -306,41 +622,54 @@ def _click_scheduling_limit_continue():
 
 
 def _submit_scheduling_limit_warning():
+    # Send the browser's whole cookie jar, not just _yatri_session: the WAF
+    # clearance cookies live alongside it and a POST without them comes back
+    # 403. (reschedule() has always done it this way.)
+    cookies = _browser_cookies()
+    if "_yatri_session" not in cookies:
+        raise SessionExpired("No _yatri_session cookie — the session is gone, cannot submit the limit warning.")
     headers = {
-        "User-Agent": driver.execute_script("return navigator.userAgent;"),
+        "User-Agent": _browser_user_agent(),
         "Referer": APPOINTMENT_URL,
-        "Cookie": "_yatri_session=" + driver.get_cookie("_yatri_session")["value"],
     }
+    try:
+        utf8 = driver.find_element(by=By.NAME, value="utf8").get_attribute("value")
+        token = driver.find_element(by=By.NAME, value="authenticity_token").get_attribute("value")
+    except Exception:
+        form = _reschedule_form_fields()
+        utf8, token = form["utf8"], form["authenticity_token"]
     data = {
-        "utf8": driver.find_element(by=By.NAME, value="utf8").get_attribute("value"),
-        "authenticity_token": driver.find_element(by=By.NAME, value="authenticity_token").get_attribute("value"),
+        "utf8": utf8,
+        "authenticity_token": token,
         "confirmed_limit_message": "1",
         "commit": "Continue",
     }
-    requests.post(APPOINTMENT_URL, headers=headers, data=data, timeout=30)
+    r = requests.post(APPOINTMENT_URL, headers=headers, cookies=cookies, data=data, timeout=30)
+    if r.status_code >= 400:
+        log.warning(f"\tScheduling-limit POST returned HTTP {r.status_code}")
     driver.get(APPOINTMENT_URL)
     time.sleep(STEP_TIME)
 
 
 def dismiss_scheduling_limit_warning():
-    global scheduling_limit_notified
+    global scheduling_limit_notified, auto_reschedule_enabled, site_remaining_attempts
     if not is_scheduling_limit_warning():
         return False
 
-    print("\tScheduling Limit Warning detected, dismissing...")
+    log.info("\tScheduling Limit Warning detected, dismissing...")
     remaining = re.search(r"You have (\d+) remaining attempt", driver.page_source)
     _acknowledge_scheduling_limit_checkbox()
 
     if _click_scheduling_limit_continue() and not is_scheduling_limit_warning():
-        print("\tScheduling Limit Warning dismissed via Continue button.")
+        log.info("\tScheduling Limit Warning dismissed via Continue button.")
     elif not is_scheduling_limit_warning():
         pass
     else:
-        print("\tContinue button not found or ineffective, submitting warning form via POST...")
+        log.info("\tContinue button not found or ineffective, submitting warning form via POST...")
         _submit_scheduling_limit_warning()
 
     if is_scheduling_limit_warning():
-        print("\tPOST did not clear warning, trying direct URL...")
+        log.info("\tPOST did not clear warning, trying direct URL...")
         driver.get(f"{APPOINTMENT_URL}?confirmed_limit_message=1&commit=Continue")
         time.sleep(STEP_TIME)
 
@@ -348,13 +677,22 @@ def dismiss_scheduling_limit_warning():
         raise RuntimeError("Could not dismiss scheduling limit warning")
 
     Wait(driver, 30).until(lambda d: not is_scheduling_limit_warning())
-    print("\tScheduling Limit Warning dismissed.")
-    if remaining and not scheduling_limit_notified:
-        send_notification(
-            "LIMIT",
-            f"Scheduling limit warning acknowledged. {remaining.group(1)} reschedule attempt(s) remaining.",
-        )
-        scheduling_limit_notified = True
+    log.info("\tScheduling Limit Warning dismissed.")
+    if remaining:
+        remaining_attempts = int(remaining.group(1))
+        site_remaining_attempts = remaining_attempts
+        log.info(f"\tSite reports {remaining_attempts} remaining reschedule attempt(s).")
+        # The site itself says there is nothing left — booking again would fail
+        # anyway, so drop to notify-only instead of spending the loop on POSTs.
+        if remaining_attempts == 0 and auto_reschedule_enabled:
+            auto_reschedule_enabled = False
+            send_notification("LIMIT", "The site reports 0 remaining reschedule attempts — switching to notify-only.")
+        elif not scheduling_limit_notified:
+            send_notification(
+                "LIMIT",
+                f"Scheduling limit warning acknowledged. {remaining_attempts} reschedule attempt(s) remaining.",
+            )
+            scheduling_limit_notified = True
     return True
 
 
@@ -367,31 +705,61 @@ def ensure_appointment_page_ready():
     dismiss_scheduling_limit_warning()
     appointment_page_ready = True
 
-def send_notification(title, msg):
-    print("Sending notification!")
-    if not DISCORD_BOT_TOKEN or not DISCORD_CHANNEL_ID:
-        print("Discord not configured, skipping notification.")
-        return
 
-    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
-    headers = {
-        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    content = f"**VISA - {title}**\n{msg}"
-    if len(content) > 2000:
-        content = content[:1997] + "..."
+# The appointment page prints the booked slot as e.g.
+# "Consular Appointment  13 November, 2027, 08:30 Toronto local time".
+CONSULAR_APPT_DATE_RE = re.compile(
+    r"consular[-_ ]?appt.{0,600}?(\d{1,2})\s+([A-Za-z]{3,}),?\s+(\d{4})", re.I | re.S)
+GENERIC_APPT_DATE_RE = re.compile(
+    r"(\d{1,2})\s+([A-Za-z]{3,}),?\s+(\d{4}),\s*\d{1,2}:\d{2}", re.I)
 
+_current_appointment = {"date": None, "fetched_at": 0.0}
+CURRENT_APPOINTMENT_TTL = 10 * minute
+
+
+def _parse_appointment_date(day, month_name, year):
+    for fmt in ("%d %B %Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(f"{day} {month_name} {year}", fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_appointment_date(html):
+    for regex in (CONSULAR_APPT_DATE_RE, GENERIC_APPT_DATE_RE):
+        match = regex.search(html or "")
+        if match:
+            parsed = _parse_appointment_date(*match.groups())
+            if parsed:
+                return parsed
+    return None
+
+
+def current_appointment_date(force=False):
+    """The appointment currently on the account, or None when it can't be read.
+    Two jobs: the safety rail that stops us booking a *later* date than the one
+    we already hold, and turning an UNCERTAIN reschedule reply into a definite
+    answer. Unknown (None) never blocks rescheduling — the site changes its
+    markup often enough that failing closed would break the whole bot."""
+    cached = _current_appointment["date"]
+    if not force and cached and time.time() - _current_appointment["fetched_at"] < CURRENT_APPOINTMENT_TTL:
+        return cached
+    html = ""
     try:
-        response = requests.post(url, headers=headers, json={"content": content}, timeout=30)
-        response.raise_for_status()
-        print("Discord notification sent.")
-    except requests.RequestException as e:
-        print(f"Discord notification failed: {e}")
+        if APPOINTMENT_URL in (driver.current_url or ""):
+            html = driver.page_source
+    except Exception:
+        html = ""
+    parsed = _extract_appointment_date(html)
+    if parsed is None:
+        parsed = _extract_appointment_date(_requests_get_html(APPOINTMENT_URL).get("body") or "")
+    if parsed:
+        _current_appointment.update(date=parsed, fetched_at=time.time())
+    return parsed
 
 
 def auto_action(label, find_by, el_type, action, value, sleep_time=0):
-    print("\t"+ label +":", end="")
     # Find Element By
     match find_by.lower():
         case 'id':
@@ -412,7 +780,7 @@ def auto_action(label, find_by, el_type, action, value, sleep_time=0):
             item.click()
         case _:
             return 0
-    print("\t\tCheck!")
+    log.info(f"\t{label}: Check!")
     if sleep_time:
         time.sleep(sleep_time)
 
@@ -421,20 +789,21 @@ def is_blocked_page():
     title = (driver.title or "").lower()
     if "403" in title or "forbidden" in title:
         return True
-    snippet = driver.page_source[:4000].lower()
+    snippet = _page_text().lower()
     return "403 forbidden" in snippet or "access denied" in snippet
 
 
 def start_process():
-    print(f"\tOpening sign-in: {SIGN_IN_LINK}")
+    log.info(f"\tOpening sign-in: {SIGN_IN_LINK}")
     driver.get(SIGN_IN_LINK)
     time.sleep(STEP_TIME)
     if is_blocked_page():
         save_debug_artifacts("403-forbidden")
         raise RuntimeError(
             "Site returned 403 Forbidden (bot/WAF block). "
-            "Set HEADLESS = False in config.ini (NixOS service uses xvfb-run), "
-            "or run the scheduler from your home computer instead of the server."
+            "Keep the stealth options in build_chrome_options()/apply_stealth() "
+            "(a default headless fingerprint is blocked outright), or run the "
+            "scheduler from your home computer instead of the server."
         )
     try:
         Wait(driver, 90).until(
@@ -451,13 +820,13 @@ def start_process():
     try:
         auto_action("Click bounce", "xpath", '//a[@class="down-arrow bounce"]', "click", "", STEP_TIME)
     except Exception:
-        print("\tNo bounce arrow on page, continuing.")
+        log.info("\tNo bounce arrow on page, continuing.")
     auto_action("Email", "id", "user_email", "send", USERNAME, STEP_TIME)
     auto_action("Password", "id", "user_password", "send", PASSWORD, STEP_TIME)
     auto_action("Privacy", "class", "icheckbox", "click", "", STEP_TIME)
     auto_action("Enter Panel", "name", "commit", "click", "", STEP_TIME)
     Wait(driver, 90).until(EC.presence_of_element_located((By.XPATH, "//a[contains(text(), '" + REGEX_CONTINUE + "')]")))
-    print("\n\tlogin successful!\n")
+    log.info("\tlogin successful!")
 
 RESCHEDULE_FIELDS = (
     "utf8",
@@ -562,13 +931,22 @@ def _classify_reschedule_response(r):
     return "UNCERTAIN", "no recognizable success/failure signal"
 
 
+def verify_reschedule(date):
+    """Read the appointment back off the account: True/False, or None when the
+    page can't be parsed. This is what makes an UNCERTAIN reply actionable."""
+    booked = current_appointment_date(force=True)
+    if booked is None:
+        return None
+    return booked.strftime("%Y-%m-%d") == date
+
+
 def reschedule(date):
+    global reschedule_attempts_used
     ensure_appointment_page_ready()
     time_slot = get_time(date)
     form = _reschedule_form_fields()
-    cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
     headers = {
-        "User-Agent": driver.execute_script("return navigator.userAgent;"),
+        "User-Agent": _browser_user_agent(),
         "Referer": APPOINTMENT_URL,
     }
     data = {
@@ -577,9 +955,29 @@ def reschedule(date):
         "appointments[consulate_appointment][date]": date,
         "appointments[consulate_appointment][time]": time_slot,
     }
-    r = requests.post(APPOINTMENT_URL, headers=headers, cookies=cookies, data=data, timeout=60)
+    reschedule_attempts_used += 1
+    r = requests.post(APPOINTMENT_URL, headers=headers, cookies=_browser_cookies(), data=data, timeout=60)
     status, reason = _classify_reschedule_response(r)
-    detail = f"(HTTP {r.status_code}; {reason}; resp: {_response_summary(r.text)})"
+    # Don't trust the response body alone: read the appointment back. This turns
+    # UNCERTAIN into a real answer and catches a "success" banner that didn't
+    # actually move the appointment.
+    verified = verify_reschedule(date)
+    detail = f"(HTTP {r.status_code}; {reason}; verified={verified}; resp: {_response_summary(r.text)})"
+    if verified is True:
+        return ["SUCCESS", f"Rescheduled Successfully! {date} {time_slot} {detail}"]
+    if verified is False:
+        booked = current_appointment_date()
+        held = booked.date() if booked else "unknown"
+        if status == "SUCCESS":
+            # The body claims success but the appointment page still shows the
+            # old date. Either the booking silently failed or we misread the
+            # page — say so instead of guessing, and keep monitoring.
+            return ["UNCERTAIN", (
+                f"Server reported success but the appointment page still shows {held} — "
+                f"check the site manually! {date} {time_slot} {detail}")]
+        return ["FAIL", f"Reschedule did NOT take effect — account still shows {held}. {date} {time_slot} {detail}"]
+    # verified is None: the appointment page couldn't be parsed, fall back to
+    # whatever the POST response itself suggested.
     if status == "SUCCESS":
         return ["SUCCESS", f"Rescheduled Successfully! {date} {time_slot} {detail}"]
     if status == "UNCERTAIN":
@@ -591,15 +989,21 @@ def get_date():
     global appointment_page_ready
     ensure_appointment_page_ready()
     try:
-        return fetch_json(DATE_URL)
+        dates = fetch_json(DATE_URL)
     except RuntimeError:
         # A non-JSON page can mean the scheduling-limit warning re-appeared;
         # re-prime the appointment page once and retry.
         if is_scheduling_limit_warning():
             appointment_page_ready = False
             ensure_appointment_page_ready()
-            return fetch_json(DATE_URL)
-        raise
+            dates = fetch_json(DATE_URL)
+        else:
+            raise
+    if not isinstance(dates, list):
+        # The endpoint answers with a JSON array; anything else (an error
+        # object, a captcha payload) would silently iterate into nonsense.
+        raise RuntimeError(f"Expected a list of days from {DATE_URL}, got: {str(dates)[:300]}")
+    return dates
 
 def get_time(date):
     ensure_appointment_page_ready()
@@ -612,40 +1016,94 @@ def get_time(date):
     # and take the earliest explicitly, matching the "earliest slot" goal.
     sorted_times = sorted(available_times)
     time_slot = sorted_times[0]
-    print(f"Got time successfully! {date} {time_slot} (of {len(sorted_times)} available: {', '.join(sorted_times)})")
+    log.info(f"Got time successfully! {date} {time_slot} (of {len(sorted_times)} available: {', '.join(sorted_times)})")
     return time_slot
-
-
-def is_logged_in():
-    content = driver.page_source
-    if(content.find("error") != -1):
-        return False
-    return True
 
 
 def get_available_dates(dates):
     matches = []
     for d in dates:
-        date = d.get('date')
+        date = d.get('date') if isinstance(d, dict) else None
         if not date:
             continue
-        new_date = datetime.strptime(date, "%Y-%m-%d")
+        try:
+            new_date = datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            continue
         if PERIOD_START_DT <= new_date <= PERIOD_END_DT and not is_excluded_date(new_date):
             matches.append(date)
-    return matches, PERIOD_START_DT, PERIOD_END_DT
+    return sorted(matches)
 
 
-def info_logger(file_path, log):
-    # file_path: e.g. "log.txt"
-    with open(file_path, "a") as file:
-        file.write(str(datetime.now().time()) + ":\n" + log + "\n")
+def choose_target(candidates):
+    """Earliest candidate still worth an attempt: not on cooldown from a failed
+    booking, and — when ONLY_EARLIER — strictly before the appointment already
+    on the account. Returns (date, skip_reason); date is None when nothing is
+    eligible right now."""
+    held = current_appointment_date() if ONLY_EARLIER else None
+    now_ts = time.time()
+    cooling = []
+    for date in sorted(candidates):
+        if held and datetime.strptime(date, "%Y-%m-%d") >= held:
+            # Sorted ascending, so every remaining candidate is later too.
+            return None, f"all candidates are on/after the appointment you already hold ({held.date()})"
+        failed_at = failed_targets.get(date)
+        if failed_at and now_ts - failed_at < RESCHEDULE_RETRY_COOLDOWN * minute:
+            cooling.append(date)
+            continue
+        return date, None
+    if cooling:
+        return None, f"{len(cooling)} candidate(s) on cooldown after a failed attempt: {', '.join(cooling)}"
+    return None, "no eligible candidate"
+
+
+def effective_attempt_cap():
+    """How many bookings this process may still POST. MAX_RESCHEDULE_ATTEMPTS is
+    our own guard; the count the site prints on the limit warning is the real
+    quota, so take whichever is lower. 0 means no cap is known."""
+    cap = MAX_RESCHEDULE_ATTEMPTS
+    if site_remaining_attempts is None:
+        return cap
+    if not cap:
+        return site_remaining_attempts
+    return min(cap, site_remaining_attempts)
+
+
+def empty_list_looks_like_ban():
+    """An empty days list is ambiguous: it is the normal answer when the
+    consulate has no open day at all, and also what a soft rate-limit returns.
+    If the appointment page still renders the booking form for us, the session
+    is healthy and the list is genuinely empty — sleeping for hours there would
+    just mean missing the next slot that opens."""
+    result = _requests_get_html(APPOINTMENT_URL)
+    body = result.get("body") or ""
+    if not result.get("status"):
+        return True
+    if "sign_in" in (result.get("url") or "") or "user_email" in body:
+        return True
+    return "authenticity_token" not in body
+
+
+def retry_sleep_seconds(unchanged_polls=0):
+    """Random wait inside [RETRY_TIME_L_BOUND, RETRY_TIME_U_BOUND]. With
+    ADAPTIVE_PACING the upper bound starts at the midpoint right after the
+    available-date list changed (something is moving — look again sooner) and
+    ramps back to the configured bound while nothing happens. It never waits
+    longer than configured, nor shorter than the lower bound."""
+    low, high = sorted((int(RETRY_TIME_L_BOUND), int(RETRY_TIME_U_BOUND)))
+    if ADAPTIVE_PACING and high > low and ADAPTIVE_RAMP_POLLS > 0:
+        ramp = min(1.0, unchanged_polls / ADAPTIVE_RAMP_POLLS)
+        midpoint = low + (high - low) // 2
+        high = int(midpoint + (high - midpoint) * ramp)
+        high = max(low, high)
+    return random.randint(low, high)
 
 
 class RunReporter:
     def __init__(self):
-        self.session_start = datetime.now()
+        self.session_start = now()
         self.first_round_reported = False
-        self.daily_date = datetime.now().date()
+        self.daily_date = now().date()
         self._reset_daily()
 
     def _reset_daily(self):
@@ -691,10 +1149,10 @@ class RunReporter:
         self.daily["rests"] += 1
 
     def maybe_send_daily_report(self):
-        today = datetime.now().date()
+        today = now().date()
         if today == self.daily_date:
             return
-        uptime = datetime.now() - self.session_start
+        uptime = now() - self.session_start
         hours, rem = divmod(int(uptime.total_seconds()), 3600)
         minutes = rem // 60
         d = self.daily
@@ -733,30 +1191,54 @@ class RunReporter:
         self.first_round_reported = True
 
 
+def _prune_debug_artifacts():
+    """Keep only the newest DEBUG_ARTIFACT_LIMIT files: these are full page
+    dumps written on every block/login failure and they pile up unbounded."""
+    if DEBUG_ARTIFACT_LIMIT <= 0:
+        return
+    try:
+        files = [os.path.join(DEBUG_DIR, f) for f in os.listdir(DEBUG_DIR)]
+        files = [f for f in files if os.path.isfile(f)]
+        for stale in sorted(files, key=os.path.getmtime, reverse=True)[DEBUG_ARTIFACT_LIMIT:]:
+            os.remove(stale)
+    except OSError as e:
+        log.debug(f"Could not prune debug artifacts: {e}")
+
+
 def save_debug_artifacts(label):
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = f"debug_{label}_{ts}"
+    ts = now().strftime("%Y%m%d-%H%M%S")
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+    except OSError as e:
+        log.warning(f"\tCould not create {DEBUG_DIR}: {e}")
+        return
+    # 0600: the HTML dump carries session cookies' side effects (CSRF tokens,
+    # personal details) and lands next to the logs.
+    base = os.path.join(DEBUG_DIR, f"debug_{label}_{ts}")
     try:
         driver.save_screenshot(f"{base}.png")
-        print(f"\tDebug screenshot: {base}.png")
+        log.info(f"\tDebug screenshot: {base}.png")
     except Exception as e:
-        print(f"\tCould not save screenshot: {e}")
+        log.warning(f"\tCould not save screenshot: {e}")
     try:
-        with open(f"{base}.html", "w", encoding="utf-8") as f:
+        path = f"{base}.html"
+        with open(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
             f.write(driver.page_source)
-        print(f"\tDebug HTML: {base}.html")
+        log.info(f"\tDebug HTML: {path}")
     except Exception as e:
-        print(f"\tCould not save HTML: {e}")
+        log.warning(f"\tCould not save HTML: {e}")
+    _prune_debug_artifacts()
 
 
 def should_use_headless():
     if HEADLESS:
         return True
-    if os.environ.get("DISPLAY"):
-        print(f"Using headed Chrome on DISPLAY={os.environ['DISPLAY']}")
-        return False
-    print("No DISPLAY set; forcing headless Chrome.")
-    return True
+    # DISPLAY is an X11 concept: macOS/Windows run a visible Chrome without it,
+    # so only treat "no DISPLAY" as headless-only on Linux.
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        log.info("No DISPLAY set; forcing headless Chrome.")
+        return True
+    return False
 
 
 def apply_stealth(drv):
@@ -770,10 +1252,13 @@ window.chrome = { runtime: {} };
 """
         })
     except Exception as e:
-        print(f"\tStealth CDP script failed: {e}")
+        log.warning(f"\tStealth CDP script failed: {e}")
 
 
 def build_chrome_options():
+    # Verified against the live site (2026-09-15): a default headless Chrome
+    # fingerprint (HeadlessChrome UA + automation flags) gets a flat 403 from
+    # the WAF, while this combination returns 200 headless. Don't drop these.
     options = webdriver.ChromeOptions()
     chrome_bin = (
         CHROME_BIN
@@ -828,13 +1313,46 @@ def init_driver():
 
 
 def reset_driver():
-    global driver
+    # No `global driver` needed: init_driver() does the rebinding.
     if driver is not None:
         try:
             driver.quit()
         except Exception:
             pass
     return init_driver()
+
+
+def sign_out_quietly():
+    try:
+        driver.get(SIGN_OUT_LINK)
+    except Exception:
+        pass
+
+
+def idle_until_active():
+    """Outside ACTIVE_HOURS: sign out, drop the browser and sleep until the
+    window opens again (plus jitter, so every restart doesn't hit the site at
+    the same second). Sleeping here instead of polling is the cheapest way to
+    stay under the site's radar — no requests at all for the hours the site
+    isn't worth polling."""
+    global driver
+    wait_s = seconds_until_active() + random.randint(0, 300)
+    resume_at = now() + timedelta(seconds=wait_s)
+    log.info(f"Outside ACTIVE_HOURS ({ACTIVE_HOURS}); sleeping {wait_s // 60} min until {resume_at:%Y-%m-%d %H:%M %Z}")
+    send_notification("IDLE", f"Outside active hours ({ACTIVE_HOURS}). Next check around {resume_at:%Y-%m-%d %H:%M %Z}.")
+    sign_out_quietly()
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    driver = None
+    time.sleep(wait_s)
+    try:
+        init_driver()
+    except Exception as e:
+        # Leave driver as None: the login loop below calls reset_driver() on
+        # failure, which retries the init with the normal backoff.
+        log.warning(f"Driver did not come back up after the idle window: {e}")
 
 
 # When MAX_LOGIN_ATTEMPTS is exhausted and every single attempt failed with
@@ -876,21 +1394,24 @@ def decay_connection_backoff_state():
     save_connection_backoff_state(load_connection_backoff_state() // 2)
 
 
-def exit_with_connection_backoff(errors, stop_msg, log_file):
+def connection_backoff_seconds(level):
+    return min(
+        CONNECTION_BACKOFF_BASE_SECONDS * (2 ** (level - 1)),
+        CONNECTION_BACKOFF_MAX_SECONDS,
+    )
+
+
+def exit_with_connection_backoff(errors, stop_msg):
     if errors and all(CONNECTION_REFUSED_MARKER in str(e) for e in errors):
         level = load_connection_backoff_state() + 1
         save_connection_backoff_state(level)
-        backoff_s = min(
-            CONNECTION_BACKOFF_BASE_SECONDS * (2 ** (level - 1)),
-            CONNECTION_BACKOFF_MAX_SECONDS,
-        )
+        backoff_s = connection_backoff_seconds(level)
         stop_msg = (
             f"{stop_msg} All {len(errors)} attempts were {CONNECTION_REFUSED_MARKER} "
             f"(the site's backend, not us) — sleeping {backoff_s}s before exit "
             f"(backoff level {level})."
         )
-        print(stop_msg)
-        info_logger(log_file, stop_msg)
+        log.error(stop_msg)
         send_notification("STOP", stop_msg)
         time.sleep(backoff_s)
     else:
@@ -899,8 +1420,41 @@ def exit_with_connection_backoff(errors, stop_msg, log_file):
     sys.exit(1)
 
 
+def print_effective_config():
+    settings = [
+        ("config", CONFIG_PATH),
+        ("embassy", f"{YOUR_EMBASSY} ({EMBASSY}, facility {FACILITY_ID})"),
+        ("target period", f"{PERIOD_START} .. {PERIOD_END}"),
+        ("excluded", ", ".join(f"{s.date()}..{e.date()}" for s, e in EXCLUDED_INTERVALS) or "none"),
+        ("auto reschedule", f"{AUTO_RESCHEDULE} (only earlier: {ONLY_EARLIER}, max attempts: {MAX_RESCHEDULE_ATTEMPTS or 'unlimited'})"),
+        ("timezone", TIMEZONE or "system local"),
+        ("active hours", ACTIVE_HOURS or "24/7"),
+        ("retry window", f"{RETRY_TIME_L_BOUND:g}-{RETRY_TIME_U_BOUND:g}s (adaptive: {ADAPTIVE_PACING})"),
+        ("work/cooldown", f"{WORK_LIMIT_TIME:g}h on, {WORK_COOLDOWN_TIME:g}h off; ban cooldown {BAN_COOLDOWN_TIME:g}h"),
+        ("empty list policy", EMPTY_LIST_POLICY),
+        ("notifications", "discord" if DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID else "disabled"),
+        ("browser", f"headless={should_use_headless()} local={LOCAL_USE}"),
+        ("logs", f"{LOG_DIR} (keep {LOG_RETENTION_DAYS} days)"),
+    ]
+    width = max(len(k) for k, _ in settings)
+    for key, value in settings:
+        print(f"{key.rjust(width)} : {value}")
+
+
+def empty_list_is_ban():
+    if EMPTY_LIST_POLICY == "ban":
+        return True
+    if EMPTY_LIST_POLICY == "retry":
+        return False
+    return empty_list_looks_like_ban()
+
+
 if __name__ == "__main__":
-    _startup_log = "log_" + str(datetime.now().date()) + ".txt"
+    setup_logging()
+    if CLI_ARGS.check_config:
+        print_effective_config()
+        sys.exit(0)
+    log.info(f"Starting US visa scheduler with config {CONFIG_PATH}")
     driver_attempts = 0
     driver_attempt_errors = []
     while True:
@@ -911,8 +1465,7 @@ if __name__ == "__main__":
             driver_attempts += 1
             driver_attempt_errors.append(e)
             msg = f"Driver init failed ({driver_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
-            print(msg)
-            info_logger(_startup_log, msg)
+            log.error(msg)
             # ERR_CONNECTION_REFUSED attempts get one summary via the STOP
             # notification below (exit_with_connection_backoff) instead of
             # one Discord message per attempt — same failure, no new info.
@@ -923,36 +1476,45 @@ if __name__ == "__main__":
                     f"Driver failed to start {driver_attempts} times. "
                     f"Exiting non-zero — check chromedriver/chromium install."
                 )
-                print(stop_msg)
-                info_logger(_startup_log, stop_msg)
-                exit_with_connection_backoff(driver_attempt_errors, stop_msg, _startup_log)
-            retry_low = int(RETRY_TIME_L_BOUND)
-            retry_high = int(RETRY_TIME_U_BOUND)
-            if retry_low > retry_high:
-                retry_low, retry_high = retry_high, retry_low
-            time.sleep(random.randint(retry_low, retry_high))
+                log.error(stop_msg)
+                exit_with_connection_backoff(driver_attempt_errors, stop_msg)
+            time.sleep(retry_sleep_seconds())
     first_loop = True
     END_MSG_TITLE = "STOP"
+    end_msg = "Scheduler stopped."
     reporter = RunReporter()
     last_notified_candidates = None
+    # Adaptive pacing state: how many polls in a row returned the same set of
+    # available dates (nothing moving -> drift back to the slower cadence).
+    last_dates_key = None
+    unchanged_polls = 0
     # t0/total_time/Req_count drive the WORK_LIMIT_TIME anti-ban cooldown.
     # They must only reset when we deliberately take a cooldown break
-    # (BANNED or WORK_LIMIT below) — never on a plain re-login (e.g.
-    # SessionExpired), or repeated soft blocks would keep zeroing the clock
-    # and the cooldown that's supposed to catch that exact pattern would
-    # never trigger.
+    # (BANNED, WORK_LIMIT, or an ACTIVE_HOURS idle window below) — never on a
+    # plain re-login (e.g. SessionExpired), or repeated soft blocks would keep
+    # zeroing the clock and the cooldown that's supposed to catch that exact
+    # pattern would never trigger.
     t0 = time.time()
     total_time = 0
     Req_count = 0
     while 1:
-        LOG_FILE_NAME = "log_" + str(datetime.now().date()) + ".txt"
         reporter.maybe_send_daily_report()
+        if ACTIVE_RANGES and not in_active_window():
+            idle_until_active()
+            reset_appointment_page_state()
+            first_loop = True
+            t0 = time.time()
+            total_time = 0
+            Req_count = 0
+            continue
         if first_loop:
             reset_appointment_page_state()
             login_attempts = 0
             login_attempt_errors = []
             while True:
                 try:
+                    if driver is None:
+                        init_driver()
                     start_process()
                     decay_connection_backoff_state()
                     break
@@ -960,8 +1522,7 @@ if __name__ == "__main__":
                     login_attempts += 1
                     login_attempt_errors.append(e)
                     msg = f"Login failed ({login_attempts}/{MAX_LOGIN_ATTEMPTS}): {e}\n{traceback.format_exc()}"
-                    print(msg)
-                    info_logger(LOG_FILE_NAME, msg)
+                    log.error(msg)
                     # Same rationale as the driver-init loop above: skip the
                     # per-attempt Discord ping for ERR_CONNECTION_REFUSED,
                     # the STOP notification already summarizes the cycle.
@@ -972,178 +1533,171 @@ if __name__ == "__main__":
                             f"Login failed {login_attempts} times. "
                             f"Exiting non-zero so systemd restarts the service after a cooldown."
                         )
-                        print(stop_msg)
-                        info_logger(LOG_FILE_NAME, stop_msg)
+                        log.error(stop_msg)
                         try:
                             driver.quit()
                         except Exception:
                             pass
-                        # Non-zero exit: Restart=on-failure (nix/module.nix)
-                        # only retries on failure — exit(0) reads as "stopped
-                        # on purpose" and the service never comes back.
-                        exit_with_connection_backoff(login_attempt_errors, stop_msg, LOG_FILE_NAME)
-                    retry_low = int(RETRY_TIME_L_BOUND)
-                    retry_high = int(RETRY_TIME_U_BOUND)
-                    if retry_low > retry_high:
-                        retry_low, retry_high = retry_high, retry_low
-                    wait_s = random.randint(retry_low, retry_high)
-                    print(f"\tRetrying login in {wait_s}s after browser reset...")
+                        # Non-zero exit: Restart=on-failure (nix/module.nix and
+                        # deploy/visa-scheduler.service) only retries on
+                        # failure — exit(0) reads as "stopped on purpose" and
+                        # the service never comes back.
+                        exit_with_connection_backoff(login_attempt_errors, stop_msg)
+                    wait_s = retry_sleep_seconds()
+                    log.info(f"\tRetrying login in {wait_s}s after browser reset...")
                     reset_driver()
                     time.sleep(wait_s)
             first_loop = False
         Req_count += 1
         try:
-            msg = "-" * 60 + f"\nRequest count: {Req_count}, Log time: {datetime.today()}\n"
-            print(msg)
-            info_logger(LOG_FILE_NAME, msg)
+            log.info("-" * 60)
+            log.info(f"Request count: {Req_count}, Log time: {now()}")
             dates = get_date()
-            if not dates:
+            if not dates and empty_list_is_ban():
                 state = "BANNED"
                 detail = f"Sleeping {BAN_COOLDOWN_TIME} hours before retry."
                 reporter.record(state, dates=[], candidates=[])
                 reporter.send_first_round_if_needed(Req_count, state, [], [], detail)
-                msg = f"List is empty, Probabely banned!\n\tSleep for {BAN_COOLDOWN_TIME} hours!\n"
-                print(msg)
-                info_logger(LOG_FILE_NAME, msg)
+                msg = (
+                    "List is empty and the appointment page no longer renders for us — "
+                    f"probably a soft ban. Sleeping {BAN_COOLDOWN_TIME} hours."
+                )
+                log.warning(msg)
                 send_notification("BAN", msg)
-                try:
-                    driver.get(SIGN_OUT_LINK)
-                except Exception:
-                    pass
+                sign_out_quietly()
                 time.sleep(BAN_COOLDOWN_TIME * hour)
                 first_loop = True
                 t0 = time.time()
                 total_time = 0
                 Req_count = 0
+                continue
+
+            candidates = get_available_dates(dates)
+            all_dates = [d.get('date') for d in dates if isinstance(d, dict) and d.get('date')]
+            log.info("Available dates: " + (", ".join(all_dates) if all_dates else "none"))
+
+            if not dates:
+                # Empty, but the session is demonstrably fine: the consulate
+                # simply has nothing open. Keep the normal cadence instead of
+                # sleeping for hours and missing the next slot that appears.
+                state = "NO_SLOTS"
+                detail = "No open days at this consulate right now (session healthy)."
+            elif candidates:
+                state = "IN_PERIOD"
+                mode = "auto-reschedule" if (AUTO_RESCHEDULE and auto_reschedule_enabled) else "notify only"
+                detail = (
+                    f"Found {len(candidates)} date(s) in period "
+                    f"({PERIOD_START_DT.date()} to {PERIOD_END_DT.date()}). Mode: {mode}."
+                )
             else:
-                candidates, PSD, PED = get_available_dates(dates)
-                msg = ""
-                for d in dates:
-                    msg = msg + "%s" % (d.get('date')) + ", "
-                msg = "Available dates:\n"+ msg
-                print(msg)
-                info_logger(LOG_FILE_NAME, msg)
-                if candidates:
-                    state = "IN_PERIOD"
-                    mode = "auto-reschedule" if AUTO_RESCHEDULE else "notify only"
-                    detail = (
-                        f"Found {len(candidates)} date(s) in period "
-                        f"({PSD.date()} to {PED.date()}). Mode: {mode}."
-                    )
+                state = "MONITORING"
+                detail = f"No dates in target period ({PERIOD_START_DT.date()} to {PERIOD_END_DT.date()}). Continuing to monitor."
+            log.info(f"State: {state} — {detail}")
+            reporter.record(state, dates=dates, candidates=candidates)
+            reporter.send_first_round_if_needed(Req_count, state, dates, candidates, detail)
+
+            if candidates:
+                found_msg = (
+                    f"Found {len(candidates)} date(s) in target period "
+                    f"({PERIOD_START_DT.date()} to {PERIOD_END_DT.date()}):\n{', '.join(candidates)}"
+                )
+                log.info(found_msg)
+            if candidates and AUTO_RESCHEDULE and auto_reschedule_enabled:
+                target_date, skip_reason = choose_target(candidates)
+                if target_date is None:
+                    log.info(f"Not attempting a booking: {skip_reason}")
                 else:
-                    state = "MONITORING"
-                    detail = f"No dates in target period ({PSD.date()} to {PED.date()}). Continuing to monitor."
-                reporter.record(state, dates=dates, candidates=candidates)
-                reporter.send_first_round_if_needed(Req_count, state, dates, candidates, detail)
-                if candidates:
-                    target_date = min(candidates)
-                    dates_list = ", ".join(candidates)
-                    msg = (
-                        f"Found {len(candidates)} date(s) in target period "
-                        f"({PSD.date()} to {PED.date()}):\n{dates_list}"
-                    )
-                    print(msg)
-                    info_logger(LOG_FILE_NAME, msg)
-                    if AUTO_RESCHEDULE:
-                        reporter.daily["reschedule_attempts"] += 1
-                        print(f"Auto-rescheduling to earliest in-period date: {target_date}")
-                        try:
-                            title, r_msg = reschedule(target_date)
-                        except SessionExpired:
-                            raise
-                        except Exception as e:
-                            title = "FAIL"
-                            r_msg = f"Reschedule attempt for {target_date} errored: {e}"
-                        print(r_msg)
-                        info_logger(LOG_FILE_NAME, r_msg)
-                        send_notification(title, r_msg)
-                        if title == "SUCCESS":
-                            # Booked the earliest in-window slot — stop here.
-                            END_MSG_TITLE = "SUCCESS"
-                            msg = r_msg + "\nStopping — appointment booked."
-                            break
-                        # FAIL or UNCERTAIN: keep monitoring. An UNCERTAIN
-                        # response needs manual verification, but the bot must
-                        # never silently stop watching on an unrecognized reply.
-                    else:
-                        candidates_key = tuple(candidates)
-                        if candidates_key != last_notified_candidates:
-                            notify = msg + "\nReschedule manually on the appointment page."
-                            send_notification("FOUND", notify)
-                            last_notified_candidates = candidates_key
-                else:
-                    last_notified_candidates = None
-                    msg = f"No available dates between ({PSD.date()}) and ({PED.date()})!"
-                    print(msg)
-                    info_logger(LOG_FILE_NAME, msg)
-                retry_low = int(RETRY_TIME_L_BOUND)
-                retry_high = int(RETRY_TIME_U_BOUND)
-                if retry_low > retry_high:
-                    retry_low, retry_high = retry_high, retry_low
-                RETRY_WAIT_TIME = random.randint(retry_low, retry_high)
-                t1 = time.time()
-                total_time = t1 - t0
-                msg = "\nWorking Time:  ~ {:.2f} minutes".format(total_time/minute)
-                print(msg)
-                info_logger(LOG_FILE_NAME, msg)
-                if total_time > WORK_LIMIT_TIME * hour:
-                    reporter.record_rest()
-                    send_notification("REST", f"Break-time after {WORK_LIMIT_TIME} hours | Repeated {Req_count} times")
+                    reporter.daily["reschedule_attempts"] += 1
+                    log.info(f"Auto-rescheduling to earliest eligible date: {target_date}")
                     try:
-                        driver.get(SIGN_OUT_LINK)
-                    except Exception:
-                        pass
-                    time.sleep(WORK_COOLDOWN_TIME * hour)
-                    first_loop = True
-                    t0 = time.time()
-                    total_time = 0
-                    Req_count = 0
-                else:
-                    msg = "Retry Wait Time: "+ str(RETRY_WAIT_TIME)+ " seconds"
-                    print(msg)
-                    info_logger(LOG_FILE_NAME, msg)
-                    time.sleep(RETRY_WAIT_TIME)
+                        title, r_msg = reschedule(target_date)
+                    except SessionExpired:
+                        raise
+                    except Exception as e:
+                        title = "FAIL"
+                        r_msg = f"Reschedule attempt for {target_date} errored: {e}"
+                    log.info(r_msg)
+                    send_notification(title, r_msg)
+                    if title == "SUCCESS":
+                        # Booked the earliest in-window slot — stop here.
+                        END_MSG_TITLE = "SUCCESS"
+                        end_msg = r_msg + "\nStopping — appointment booked."
+                        break
+                    # FAIL or UNCERTAIN: keep monitoring, but put this date on
+                    # cooldown. Every POST spends one of the site's limited
+                    # reschedule attempts, and a date that just failed is
+                    # almost always already taken.
+                    failed_targets[target_date] = time.time()
+                    cap = effective_attempt_cap()
+                    if cap and reschedule_attempts_used >= cap:
+                        auto_reschedule_enabled = False
+                        source = (
+                            f"the site reports {site_remaining_attempts} remaining"
+                            if site_remaining_attempts is not None and site_remaining_attempts <= (MAX_RESCHEDULE_ATTEMPTS or site_remaining_attempts)
+                            else f"MAX_RESCHEDULE_ATTEMPTS={MAX_RESCHEDULE_ATTEMPTS}"
+                        )
+                        send_notification(
+                            "LIMIT",
+                            f"Used {reschedule_attempts_used} reschedule attempt(s) without success "
+                            f"and the cap is {cap} ({source}) — switching to notify-only so the "
+                            "site's attempt quota isn't burned. Restart the service to re-enable "
+                            "auto-booking.",
+                        )
+            elif candidates:
+                candidates_key = tuple(candidates)
+                if candidates_key != last_notified_candidates:
+                    send_notification("FOUND", found_msg + "\nReschedule manually on the appointment page.")
+                    last_notified_candidates = candidates_key
+            else:
+                last_notified_candidates = None
+
+            dates_key = tuple(all_dates)
+            if dates_key == last_dates_key:
+                unchanged_polls += 1
+            else:
+                unchanged_polls = 0
+                last_dates_key = dates_key
+
+            total_time = time.time() - t0
+            log.info("Working Time: ~ {:.2f} minutes".format(total_time / minute))
+            if WORK_LIMIT_TIME and total_time > WORK_LIMIT_TIME * hour:
+                reporter.record_rest()
+                send_notification("REST", f"Break-time after {WORK_LIMIT_TIME} hours | Repeated {Req_count} times")
+                sign_out_quietly()
+                time.sleep(WORK_COOLDOWN_TIME * hour)
+                first_loop = True
+                t0 = time.time()
+                total_time = 0
+                Req_count = 0
+            else:
+                wait_s = retry_sleep_seconds(unchanged_polls)
+                log.info(f"Retry Wait Time: {wait_s} seconds")
+                time.sleep(wait_s)
         except SessionExpired as e:
             state = "SESSION"
-            detail = str(e)
             reporter.record(state)
-            reporter.send_first_round_if_needed(Req_count, state, [], [], detail)
+            reporter.send_first_round_if_needed(Req_count, state, [], [], str(e))
             msg = (
                 f"Session expired/blocked on request #{Req_count}: {e}\n"
                 f"Signing out and re-logging in before the next check."
             )
-            print(msg)
-            info_logger(LOG_FILE_NAME, msg)
+            log.warning(msg)
             send_notification("SESSION", msg[:1900])
-            try:
-                driver.get(SIGN_OUT_LINK)
-            except Exception:
-                pass
+            sign_out_quietly()
             reset_appointment_page_state()
             first_loop = True
-            retry_low = int(RETRY_TIME_L_BOUND)
-            retry_high = int(RETRY_TIME_U_BOUND)
-            if retry_low > retry_high:
-                retry_low, retry_high = retry_high, retry_low
-            time.sleep(random.randint(retry_low, retry_high))
+            time.sleep(retry_sleep_seconds())
         except Exception as e:
             state = "ERROR"
-            detail = str(e)
             reporter.record(state)
-            reporter.send_first_round_if_needed(Req_count, state, [], [], detail)
+            reporter.send_first_round_if_needed(Req_count, state, [], [], str(e))
             msg = f"Error on request #{Req_count}: {e}\n{traceback.format_exc()}"
-            print(msg)
-            info_logger(LOG_FILE_NAME, msg)
+            log.error(msg)
             send_notification("ERROR", msg[:1900])
-            retry_low = int(RETRY_TIME_L_BOUND)
-            retry_high = int(RETRY_TIME_U_BOUND)
-            if retry_low > retry_high:
-                retry_low, retry_high = retry_high, retry_low
-            time.sleep(random.randint(retry_low, retry_high))
+            time.sleep(retry_sleep_seconds())
 
-    print(msg)
-    info_logger(LOG_FILE_NAME, msg)
-    send_notification(END_MSG_TITLE, msg)
+    log.info(end_msg)
+    send_notification(END_MSG_TITLE, end_msg)
     try:
         driver.get(SIGN_OUT_LINK)
         if hasattr(driver, "stop_client"):
@@ -1154,7 +1708,5 @@ if __name__ == "__main__":
         # an unhandled exception, or systemd's Restart=on-failure would spin
         # the service back up and re-fire a reschedule for a date we already
         # booked, burning one of the site's limited scheduling attempts.
-        teardown_msg = f"Post-stop teardown failed (ignored): {e}"
-        print(teardown_msg)
-        info_logger(LOG_FILE_NAME, teardown_msg)
+        log.warning(f"Post-stop teardown failed (ignored): {e}")
     sys.exit(0)

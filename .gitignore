@@ -18,3 +18,14 @@ __pycache__/
 
 # Playwright / browser artifacts
 .playwright-cli/
+
+# macOS finder metadata
+.DS_Store
+
+# Runtime state written next to the service
+connection_backoff_state.json
+debug_*.png
+debug_*.html
+
+# Python bytecode from the test runs
+.pytest_cache/

@@ -17,11 +17,21 @@ YOUR_EMBASSY = en-am-yer
 ; True  = auto-book the earliest date found inside your window, then stop.
 ; False = only notify (you reschedule manually).
 AUTO_RESCHEDULE = True
+; Safety rail: never book a date at or after the appointment you already hold,
+; even if it falls inside the target window. Leave True unless you really want
+; to be able to move the appointment later.
+ONLY_EARLIER = True
+; Give up auto-booking after this many failed attempts and fall back to
+; notify-only (0 = unlimited). The site allows only a handful of reschedules,
+; so this keeps a stale/contended date from burning the whole quota.
+MAX_RESCHEDULE_ATTEMPTS = 6
 
 [CHROMEDRIVER]
 ; Details for the script to control Chrome
 LOCAL_USE = True
-; The NixOS service runs under xvfb-run — use HEADLESS = False there to avoid 403 blocks.
+; Headless works as long as the stealth options in visa.py stay in place (a
+; *default* headless fingerprint is 403'd by the site's WAF). The NixOS service
+; runs under xvfb-run, so HEADLESS = False is fine there too.
 HEADLESS = False
 ; Optional: override browser/driver paths (set automatically on NixOS)
 CHROME_BIN =
@@ -50,3 +60,36 @@ WORK_LIMIT_TIME = 1.5
 WORK_COOLDOWN_TIME = 2.25
 ; Temporary Banned (empty list): wait COOLDOWN_TIME (hours)
 BAN_COOLDOWN_TIME = 5
+; IANA timezone used for ACTIVE_HOURS and the daily report boundary. Blank =
+; the machine's local time (set this if the server clock isn't the consulate's).
+TIMEZONE = America/Toronto
+; Only poll during these local-time windows; the bot signs out, closes the
+; browser and sleeps the rest of the day (far fewer requests = far less ban
+; exposure). Blank = around the clock. Comma-separated HH:MM-HH:MM ranges,
+; a range may wrap past midnight:
+;   ACTIVE_HOURS = 12:00-20:00
+;   ACTIVE_HOURS = 08:00-09:30, 13:00-17:00
+ACTIVE_HOURS =
+; After a failed booking, don't re-attempt that same date for this many minutes
+; (every POST spends one of the site's limited reschedule attempts).
+RESCHEDULE_RETRY_COOLDOWN = 20
+; Collapse repeated identical error notifications within this many minutes
+; (0 = send every one). SUCCESS/FOUND/LIMIT/STOP/... are never collapsed.
+NOTIFY_MIN_INTERVAL = 15
+; Poll a little sooner right after the available-date list changes, drifting
+; back to RETRY_TIME_U_BOUND while nothing moves. Never goes outside the bounds.
+ADAPTIVE_PACING = True
+ADAPTIVE_RAMP_POLLS = 10
+; What an empty date list means:
+;   auto  = check the appointment page: still rendering for us -> the consulate
+;           simply has nothing open (keep polling); blocked -> soft ban (sleep)
+;   ban   = always assume a ban and sleep BAN_COOLDOWN_TIME (old behaviour)
+;   retry = never assume a ban, just keep polling
+EMPTY_LIST_POLICY = auto
+
+[LOGGING]
+; Rotating daily log file lives in LOG_DIR/visa.log, debug page dumps in
+; LOG_DIR/debug/.
+LOG_DIR = logs
+LOG_RETENTION_DAYS = 14
+DEBUG_ARTIFACT_LIMIT = 20

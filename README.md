@@ -23,7 +23,38 @@ pip install -r requirements.txt
 - Initial setup!
 - Edit information [config.ini.example file]. Then remove the ".example" from file name.
 - [Optional] Set up a Discord bot and add `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` in `config.ini` (see comments in `config.ini.example`).
+- Check the config before starting: `python3 visa.py --check-config` prints the effective settings and exits.
 - Run visa.py file, using `python3 visa.py`
+
+The config is looked up in this order: `--config <path>`, `$VISA_CONFIG`, `./config.ini`,
+then the copy next to `visa.py` — so the service works from any working directory.
+
+## Configuration worth knowing about
+
+| Key | What it does |
+| --- | --- |
+| `[TIME] ACTIVE_HOURS` | Only poll during these local-time windows (e.g. `12:00-20:00`, or several comma-separated ranges; a range may wrap past midnight). Outside them the bot signs out, closes the browser and sleeps. Far fewer requests = far less ban exposure. Blank = around the clock. |
+| `[TIME] TIMEZONE` | IANA zone (e.g. `America/Toronto`) that `ACTIVE_HOURS` and the daily report are measured in, so a UTC server still lines up with the consulate's clock. |
+| `[PERSONAL_INFO] ONLY_EARLIER` | Never book a date at or after the appointment you already hold, even if it is inside the target window. |
+| `[PERSONAL_INFO] MAX_RESCHEDULE_ATTEMPTS` | Fall back to notify-only after this many failed bookings, so a contended date can't burn the site's limited reschedule quota. |
+| `[TIME] RESCHEDULE_RETRY_COOLDOWN` | Minutes before the same date is attempted again after a failure. |
+| `[TIME] EMPTY_LIST_POLICY` | `auto` (default) checks whether the appointment page still renders for us before deciding an empty date list is a ban rather than "the consulate has nothing open". `ban` restores the old always-sleep behaviour. |
+| `[TIME] NOTIFY_MIN_INTERVAL` | Collapses repeated identical error notifications; booking-relevant ones are never collapsed. |
+| `[TIME] ADAPTIVE_PACING` | Polls a little sooner right after the date list changes, drifting back to `RETRY_TIME_U_BOUND` while nothing moves. Always stays inside the configured bounds. |
+| `[LOGGING] LOG_DIR` / `LOG_RETENTION_DAYS` | Rotating daily log at `LOG_DIR/visa.log`, page dumps at `LOG_DIR/debug/`. |
+
+After a reschedule POST the bot reads the appointment back off the account, so a
+"success" banner that didn't actually move anything is reported as a failure and
+an unrecognised reply usually resolves to a definite answer instead of `UNCERTAIN`.
+
+## Tests
+
+The date/window/classification logic is covered by offline unit tests (no network,
+no browser — they load `config.ini.example`):
+
+```
+python3 -m unittest discover -s tests
+```
 
 ## Run as a daemon on NixOS
 
@@ -33,8 +64,8 @@ This repo ships a NixOS module (Chromium + Python deps + systemd service).
 
 ```bash
 cp config.ini.example /etc/nixos/us-visa-scheduler.ini
-# edit credentials, embassy, Discord, and set:
-#   HEADLESS = True
+# edit credentials, embassy, Discord. The service runs under xvfb-run, so
+# HEADLESS can stay False there.
 ```
 
 ### 2. Enable the module in your flake
@@ -88,7 +119,7 @@ sudo nixos-rebuild switch
 sudo systemctl status us-visa-scheduler
 sudo systemctl restart us-visa-scheduler
 sudo journalctl -u us-visa-scheduler -f
-tail -f /var/lib/us-visa-scheduler/log_*.txt
+tail -f /var/lib/us-visa-scheduler/logs/visa.log
 ```
 
 ### Local test (without installing the service)
@@ -103,7 +134,7 @@ nix run . --
 
 For non-NixOS Linux servers:
 
-1. Copy and edit `config.ini` (set `HEADLESS = True` on a server without a display).
+1. Copy and edit `config.ini` (`HEADLESS = True` on a server without a display).
 2. Install Google Chrome or Chromium on the server.
 3. Install and enable the systemd service:
 
@@ -118,8 +149,13 @@ Useful commands:
 ```bash
 sudo systemctl status visa-scheduler   # service status
 sudo systemctl restart visa-scheduler  # restart after config changes
-tail -f logs/daemon.log                # stdout/stderr from the daemon
+tail -f logs/visa.log                  # rotating log written by visa.py
+sudo journalctl -u visa-scheduler -f   # stdout/stderr from the daemon
 ```
+
+The unit uses `Restart=on-failure` on purpose: `visa.py` exits 0 once the
+appointment is booked, and `Restart=always` would bring it back up and re-fire a
+reschedule for the date it just booked.
 
 To run as a different user or path:
 
@@ -134,7 +170,7 @@ For a one-off foreground run (without systemd):
 ```
 
 ## TODO
-- Make timing optimum. (There are lots of unanswered questions. How is the banning algorithm? How can we avoid it? etc.)
+- Make timing optimum. (`ACTIVE_HOURS` + `ADAPTIVE_PACING` are a start; the banning algorithm itself is still guesswork.)
 - Adding a GUI (Based on PyQt)
 - Multi-account support (switching between accounts in Resting times)
 - Add a sound alert for different events.

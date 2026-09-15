@@ -42,7 +42,7 @@ echo
 echo "Daemon installed."
 echo "  Start:   sudo systemctl start $SERVICE_NAME"
 echo "  Status:  sudo systemctl status $SERVICE_NAME"
-echo "  Logs:    tail -f $INSTALL_DIR/logs/daemon.log"
+echo "  Logs:    tail -f $INSTALL_DIR/logs/visa.log"
 echo "  Journal: sudo journalctl -u $SERVICE_NAME -f"
 echo
 echo "Set HEADLESS = True in config.ini when running on a headless server."
