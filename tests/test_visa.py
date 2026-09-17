@@ -255,6 +255,11 @@ class NotificationThrottleTest(unittest.TestCase):
 
 
 class EmptyListPolicyTest(unittest.TestCase):
+    def setUp(self):
+        # Each case must exercise a real probe, not a verdict cached by the last.
+        visa.reset_empty_probe()
+        self.addCleanup(visa.reset_empty_probe)
+
     def test_healthy_appointment_page_is_not_a_ban(self):
         page = {"status": 200, "url": visa.APPOINTMENT_URL,
                 "body": '<form><input name="authenticity_token" value="tok"></form>'}
@@ -306,6 +311,62 @@ class AttemptCapTest(unittest.TestCase):
         visa.site_remaining_attempts = None
         with mock.patch.object(visa, "MAX_RESCHEDULE_ATTEMPTS", 0):
             self.assertEqual(visa.effective_attempt_cap(), 0)
+
+
+class EmptyStreakBackoffTest(unittest.TestCase):
+    def test_first_empty_poll_is_not_slowed(self):
+        self.assertEqual(visa.empty_streak_multiplier(0), 1.0)
+        self.assertEqual(visa.empty_streak_multiplier(1), 1.0)
+
+    def test_streak_stretches_the_interval(self):
+        self.assertEqual(visa.empty_streak_multiplier(4), 4.0)
+
+    def test_capped(self):
+        with mock.patch.object(visa, "EMPTY_STREAK_BACKOFF_MAX", 8):
+            self.assertEqual(visa.empty_streak_multiplier(50), 8.0)
+
+    def test_cap_of_one_disables_the_backoff(self):
+        with mock.patch.object(visa, "EMPTY_STREAK_BACKOFF_MAX", 1):
+            self.assertEqual(visa.empty_streak_multiplier(50), 1.0)
+
+
+class EmptyProbeCacheTest(unittest.TestCase):
+    def setUp(self):
+        visa.reset_empty_probe()
+        self.addCleanup(visa.reset_empty_probe)
+
+    def test_probe_runs_once_then_is_cached(self):
+        blocked_page = {"status": 200, "url": visa.APPOINTMENT_URL, "body": "<h1>403</h1>"}
+        with mock.patch.object(visa, "_requests_get_html", return_value=blocked_page) as probe:
+            with mock.patch.object(visa, "EMPTY_PROBE_MIN_INTERVAL", 10):
+                self.assertTrue(visa.empty_list_looks_like_ban())
+                for _ in range(20):
+                    visa.empty_list_looks_like_ban()
+        # 20 extra empty polls must not mean 20 extra page loads.
+        self.assertEqual(probe.call_count, 1)
+
+    def test_cache_expires(self):
+        page = {"status": 200, "url": visa.APPOINTMENT_URL,
+                "body": '<input name="authenticity_token" value="t">'}
+        with mock.patch.object(visa, "_requests_get_html", return_value=page) as probe:
+            with mock.patch.object(visa, "EMPTY_PROBE_MIN_INTERVAL", 10):
+                self.assertFalse(visa.empty_list_looks_like_ban())
+                visa._empty_probe["at"] -= 11 * 60
+                self.assertFalse(visa.empty_list_looks_like_ban())
+        self.assertEqual(probe.call_count, 2)
+
+    def test_dates_coming_back_clears_the_cache(self):
+        visa._empty_probe.update(at=time.time(), verdict=True)
+        visa.reset_empty_probe()
+        self.assertIsNone(visa._empty_probe["verdict"])
+
+    def test_explicit_policies_never_probe(self):
+        with mock.patch.object(visa, "_requests_get_html") as probe:
+            with mock.patch.object(visa, "EMPTY_LIST_POLICY", "ban"):
+                self.assertTrue(visa.empty_list_is_ban())
+            with mock.patch.object(visa, "EMPTY_LIST_POLICY", "retry"):
+                self.assertFalse(visa.empty_list_is_ban())
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

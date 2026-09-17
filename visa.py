@@ -204,6 +204,13 @@ ADAPTIVE_RAMP_POLLS = config.getint('TIME', 'ADAPTIVE_RAMP_POLLS', fallback=10)
 EMPTY_LIST_POLICY = config.get('TIME', 'EMPTY_LIST_POLICY', fallback='auto').strip().lower()
 if EMPTY_LIST_POLICY not in ("auto", "ban", "retry"):
     raise SystemExit(f"[TIME] EMPTY_LIST_POLICY must be auto, ban or retry — got {EMPTY_LIST_POLICY!r}")
+# The `auto` probe costs a full HTML page load. Running it on every empty poll
+# doubles our request volume during exactly the streak that precedes a soft ban
+# (observed: 58 probes in 37 minutes, then blocked), so cache its verdict.
+EMPTY_PROBE_MIN_INTERVAL = config.getfloat('TIME', 'EMPTY_PROBE_MIN_INTERVAL', fallback=10)
+# Consecutive empty lists are the site warming up to rate-limit us: stretch the
+# wait by the streak length, up to this multiple of the normal interval.
+EMPTY_STREAK_BACKOFF_MAX = config.getfloat('TIME', 'EMPTY_STREAK_BACKOFF_MAX', fallback=8)
 
 
 def _load_timezone(name):
@@ -1069,12 +1076,33 @@ def effective_attempt_cap():
     return min(cap, site_remaining_attempts)
 
 
+_empty_probe = {"at": 0.0, "verdict": None}
+
+
+def reset_empty_probe():
+    _empty_probe.update(at=0.0, verdict=None)
+
+
 def empty_list_looks_like_ban():
     """An empty days list is ambiguous: it is the normal answer when the
     consulate has no open day at all, and also what a soft rate-limit returns.
     If the appointment page still renders the booking form for us, the session
     is healthy and the list is genuinely empty — sleeping for hours there would
-    just mean missing the next slot that opens."""
+    just mean missing the next slot that opens.
+
+    The verdict is cached for EMPTY_PROBE_MIN_INTERVAL minutes: this probe is a
+    full HTML page load, and firing it on every empty poll is itself enough
+    extra traffic to get us rate-limited."""
+    now_ts = time.time()
+    if (_empty_probe["verdict"] is not None
+            and now_ts - _empty_probe["at"] < EMPTY_PROBE_MIN_INTERVAL * minute):
+        return _empty_probe["verdict"]
+    verdict = _probe_appointment_page_blocked()
+    _empty_probe.update(at=now_ts, verdict=verdict)
+    return verdict
+
+
+def _probe_appointment_page_blocked():
     result = _requests_get_html(APPOINTMENT_URL)
     body = result.get("body") or ""
     if not result.get("status"):
@@ -1441,6 +1469,16 @@ def print_effective_config():
         print(f"{key.rjust(width)} : {value}")
 
 
+def empty_streak_multiplier(empty_streak):
+    """How much to stretch the poll interval after `empty_streak` consecutive
+    empty date lists. At this consulate an empty list is what the site returns
+    while it is warming up to rate-limit us, so polling straight through one at
+    the normal cadence is how a soft ban gets earned."""
+    if empty_streak <= 1:
+        return 1.0
+    return min(float(empty_streak), max(1.0, EMPTY_STREAK_BACKOFF_MAX))
+
+
 def empty_list_is_ban():
     if EMPTY_LIST_POLICY == "ban":
         return True
@@ -1488,6 +1526,8 @@ if __name__ == "__main__":
     # available dates (nothing moving -> drift back to the slower cadence).
     last_dates_key = None
     unchanged_polls = 0
+    # Consecutive polls that came back with an empty date list.
+    empty_streak = 0
     # t0/total_time/Req_count drive the WORK_LIMIT_TIME anti-ban cooldown.
     # They must only reset when we deliberately take a cooldown break
     # (BANNED, WORK_LIMIT, or an ACTIVE_HOURS idle window below) — never on a
@@ -1553,6 +1593,11 @@ if __name__ == "__main__":
             log.info("-" * 60)
             log.info(f"Request count: {Req_count}, Log time: {now()}")
             dates = get_date()
+            if dates:
+                empty_streak = 0
+                reset_empty_probe()
+            else:
+                empty_streak += 1
             if not dates and empty_list_is_ban():
                 state = "BANNED"
                 detail = f"Sleeping {BAN_COOLDOWN_TIME} hours before retry."
@@ -1566,6 +1611,8 @@ if __name__ == "__main__":
                 send_notification("BAN", msg)
                 sign_out_quietly()
                 time.sleep(BAN_COOLDOWN_TIME * hour)
+                empty_streak = 0
+                reset_empty_probe()
                 first_loop = True
                 t0 = time.time()
                 total_time = 0
@@ -1671,7 +1718,15 @@ if __name__ == "__main__":
                 Req_count = 0
             else:
                 wait_s = retry_sleep_seconds(unchanged_polls)
-                log.info(f"Retry Wait Time: {wait_s} seconds")
+                multiplier = empty_streak_multiplier(empty_streak)
+                if multiplier > 1:
+                    wait_s = int(wait_s * multiplier)
+                    log.info(
+                        f"Retry Wait Time: {wait_s} seconds "
+                        f"({multiplier:g}x — {empty_streak} empty list(s) in a row)"
+                    )
+                else:
+                    log.info(f"Retry Wait Time: {wait_s} seconds")
                 time.sleep(wait_s)
         except SessionExpired as e:
             state = "SESSION"

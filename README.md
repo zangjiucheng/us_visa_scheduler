@@ -39,6 +39,8 @@ then the copy next to `visa.py` — so the service works from any working direct
 | `[PERSONAL_INFO] MAX_RESCHEDULE_ATTEMPTS` | Fall back to notify-only after this many failed bookings, so a contended date can't burn the site's limited reschedule quota. |
 | `[TIME] RESCHEDULE_RETRY_COOLDOWN` | Minutes before the same date is attempted again after a failure. |
 | `[TIME] EMPTY_LIST_POLICY` | `auto` (default) checks whether the appointment page still renders for us before deciding an empty date list is a ban rather than "the consulate has nothing open". `ban` restores the old always-sleep behaviour. |
+| `[TIME] EMPTY_PROBE_MIN_INTERVAL` | Minutes the `auto` verdict is cached. The probe is a full page load, so running it on every empty poll is itself enough traffic to get rate-limited. |
+| `[TIME] EMPTY_STREAK_BACKOFF_MAX` | Consecutive empty lists stretch the poll interval by the streak length, capped at this multiple. An empty list is usually the site warming up to rate-limit you, so polling straight through one at full speed is how a soft ban gets earned. |
 | `[TIME] NOTIFY_MIN_INTERVAL` | Collapses repeated identical error notifications; booking-relevant ones are never collapsed. |
 | `[TIME] ADAPTIVE_PACING` | Polls a little sooner right after the date list changes, drifting back to `RETRY_TIME_U_BOUND` while nothing moves. Always stays inside the configured bounds. |
 | `[LOGGING] LOG_DIR` / `LOG_RETENTION_DAYS` | Rotating daily log at `LOG_DIR/visa.log`, page dumps at `LOG_DIR/debug/`. |
