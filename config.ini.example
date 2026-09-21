@@ -55,7 +55,13 @@ DISCORD_CHANNEL_ID =
 ; Time between retries/checks for available dates (seconds)
 RETRY_TIME_L_BOUND = 10
 RETRY_TIME_U_BOUND = 120
-; Cooling down after WORK_LIMIT_TIME hours of work (Avoiding Ban)(hours)
+; Cooling down after WORK_LIMIT_TIME hours of work (Avoiding Ban)(hours).
+; Mind the ratio: the cooldown is a blind spot. A 1h-on/2h-off cycle inside a
+; 10h ACTIVE_HOURS window covers only ~32% of it and leaves 135-minute gaps a
+; cancellation can appear and vanish in. Prefer a long work period with a short
+; break, and buy back the request volume with a slower RETRY_TIME_U_BOUND —
+; polling the whole window slowly beats a fast burst followed by a long blind
+; spot. Set WORK_LIMIT_TIME = 0 to disable the break entirely.
 WORK_LIMIT_TIME = 1.5
 WORK_COOLDOWN_TIME = 2.25
 ; Temporary Banned (empty list): wait COOLDOWN_TIME (hours)

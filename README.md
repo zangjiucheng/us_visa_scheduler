@@ -43,7 +43,26 @@ then the copy next to `visa.py` — so the service works from any working direct
 | `[TIME] EMPTY_STREAK_BACKOFF_MAX` | Consecutive empty lists stretch the poll interval by the streak length, capped at this multiple. An empty list is usually the site warming up to rate-limit you, so polling straight through one at full speed is how a soft ban gets earned. |
 | `[TIME] NOTIFY_MIN_INTERVAL` | Collapses repeated identical error notifications; booking-relevant ones are never collapsed. |
 | `[TIME] ADAPTIVE_PACING` | Polls a little sooner right after the date list changes, drifting back to `RETRY_TIME_U_BOUND` while nothing moves. Always stays inside the configured bounds. |
+| `[TIME] WORK_LIMIT_TIME` / `WORK_COOLDOWN_TIME` | Hours of polling, then hours of break. The break is a blind spot — see *Coverage* below. `WORK_LIMIT_TIME = 0` disables it. |
 | `[LOGGING] LOG_DIR` / `LOG_RETENTION_DAYS` | Rotating daily log at `LOG_DIR/visa.log`, page dumps at `LOG_DIR/debug/`. |
+
+### Coverage
+
+What catches a cancellation is not how fast you poll, it is how much of the
+clock you are watching. Work out the real number before tuning `RETRY_TIME_*`:
+
+```
+coverage = WORK_LIMIT_TIME / (WORK_LIMIT_TIME + WORK_COOLDOWN_TIME)
+worst-case blind gap = WORK_COOLDOWN_TIME
+```
+
+A measured example from a live deployment: `WORK_LIMIT_TIME = 1`,
+`WORK_COOLDOWN_TIME = 2` and a 10-hour `ACTIVE_HOURS` window gave 296 polls a
+night at a 37-second median interval — but only 3.2h of coverage (32%), in
+three stretches separated by 135-minute blind gaps. Moving to `3` / `0.5` and
+widening `RETRY_TIME_*` from `10-60` to `30-120` raised coverage to 86% and cut
+the worst gap to 30 minutes for about 40% more requests. Slower polls over the
+whole window beat a fast burst followed by a long blind spot.
 
 After a reschedule POST the bot reads the appointment back off the account, so a
 "success" banner that didn't actually move anything is reported as a failure and
