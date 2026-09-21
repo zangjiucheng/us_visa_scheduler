@@ -558,7 +558,10 @@ def fetch_json(url):
         )
 
 appointment_page_ready = False
-scheduling_limit_notified = False
+# Remaining-attempt count we last told the user about. Deliberately NOT reset by
+# reset_appointment_page_state(): the limit warning reappears on every re-login,
+# and re-announcing an unchanged count turned into half of all notifications.
+notified_remaining_attempts = None
 auto_reschedule_enabled = AUTO_RESCHEDULE
 reschedule_attempts_used = 0
 # What the site itself last told us is left ("You have N remaining attempt"),
@@ -569,9 +572,8 @@ failed_targets = {}
 
 
 def reset_appointment_page_state():
-    global appointment_page_ready, scheduling_limit_notified
+    global appointment_page_ready
     appointment_page_ready = False
-    scheduling_limit_notified = False
 
 
 def is_scheduling_limit_warning():
@@ -658,8 +660,29 @@ def _submit_scheduling_limit_warning():
     time.sleep(STEP_TIME)
 
 
+def announce_remaining_attempts(remaining_attempts):
+    """Tell the user how many reschedules the site says are left, but only when
+    that number actually moved. The limit warning is re-shown on every re-login
+    and the session drops several times a night, so announcing it unconditionally
+    made it half of all notifications. Returns True if something was sent."""
+    global notified_remaining_attempts, auto_reschedule_enabled
+    if remaining_attempts == 0 and auto_reschedule_enabled:
+        auto_reschedule_enabled = False
+        send_notification("LIMIT", "The site reports 0 remaining reschedule attempts — switching to notify-only.")
+        notified_remaining_attempts = 0
+        return True
+    if remaining_attempts != notified_remaining_attempts:
+        send_notification(
+            "LIMIT",
+            f"Scheduling limit warning acknowledged. {remaining_attempts} reschedule attempt(s) remaining.",
+        )
+        notified_remaining_attempts = remaining_attempts
+        return True
+    return False
+
+
 def dismiss_scheduling_limit_warning():
-    global scheduling_limit_notified, auto_reschedule_enabled, site_remaining_attempts
+    global site_remaining_attempts
     if not is_scheduling_limit_warning():
         return False
 
@@ -691,15 +714,7 @@ def dismiss_scheduling_limit_warning():
         log.info(f"\tSite reports {remaining_attempts} remaining reschedule attempt(s).")
         # The site itself says there is nothing left — booking again would fail
         # anyway, so drop to notify-only instead of spending the loop on POSTs.
-        if remaining_attempts == 0 and auto_reschedule_enabled:
-            auto_reschedule_enabled = False
-            send_notification("LIMIT", "The site reports 0 remaining reschedule attempts — switching to notify-only.")
-        elif not scheduling_limit_notified:
-            send_notification(
-                "LIMIT",
-                f"Scheduling limit warning acknowledged. {remaining_attempts} reschedule attempt(s) remaining.",
-            )
-            scheduling_limit_notified = True
+        announce_remaining_attempts(remaining_attempts)
     return True
 
 

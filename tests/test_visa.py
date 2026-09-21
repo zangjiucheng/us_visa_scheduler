@@ -369,5 +369,40 @@ class EmptyProbeCacheTest(unittest.TestCase):
         probe.assert_not_called()
 
 
+class RemainingAttemptsNoticeTest(unittest.TestCase):
+    def setUp(self):
+        visa.notified_remaining_attempts = None
+        visa.auto_reschedule_enabled = True
+        self.addCleanup(setattr, visa, "notified_remaining_attempts", None)
+        self.addCleanup(setattr, visa, "auto_reschedule_enabled", visa.AUTO_RESCHEDULE)
+
+    def test_announces_once_then_stays_quiet(self):
+        with mock.patch.object(visa, "send_notification") as notify:
+            self.assertTrue(visa.announce_remaining_attempts(2))
+            # The limit warning reappears on every re-login; that is not news.
+            for _ in range(10):
+                self.assertFalse(visa.announce_remaining_attempts(2))
+        self.assertEqual(notify.call_count, 1)
+
+    def test_announces_again_when_the_count_moves(self):
+        with mock.patch.object(visa, "send_notification") as notify:
+            visa.announce_remaining_attempts(2)
+            visa.announce_remaining_attempts(2)
+            self.assertTrue(visa.announce_remaining_attempts(1))
+        self.assertEqual(notify.call_count, 2)
+
+    def test_zero_disables_auto_booking(self):
+        with mock.patch.object(visa, "send_notification") as notify:
+            self.assertTrue(visa.announce_remaining_attempts(0))
+        self.assertFalse(visa.auto_reschedule_enabled)
+        self.assertIn("0 remaining", notify.call_args[0][1])
+
+    def test_zero_is_not_re_announced_once_auto_booking_is_off(self):
+        with mock.patch.object(visa, "send_notification") as notify:
+            visa.announce_remaining_attempts(0)
+            self.assertFalse(visa.announce_remaining_attempts(0))
+        self.assertEqual(notify.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
