@@ -1155,6 +1155,7 @@ class RunReporter:
             "errors": 0,
             "bans": 0,
             "rests": 0,
+            "sessions": 0,
             "reschedule_attempts": 0,
             "last_state": None,
             "min_available": None,
@@ -1179,6 +1180,8 @@ class RunReporter:
             self.daily["bans"] += 1
         elif state == "ERROR":
             self.daily["errors"] += 1
+        elif state == "SESSION":
+            self.daily["sessions"] += 1
         if dates is not None:
             count = len(dates)
             if self.daily["min_available"] is None:
@@ -1209,6 +1212,7 @@ class RunReporter:
             f"Date: {self.daily_date}\n"
             f"Requests: {d['requests']}\n"
             f"Errors: {d['errors']} | Bans: {d['bans']} | Rest breaks: {d['rests']}\n"
+            f"Session drops (auto-recovered): {d['sessions']}\n"
             f"Last state: {d['last_state'] or 'n/a'}\n"
             f"Available dates per check: {available_range}\n"
             f"Max in target period: {d['max_in_period']}\n"
@@ -1751,8 +1755,13 @@ if __name__ == "__main__":
                 f"Session expired/blocked on request #{Req_count}: {e}\n"
                 f"Signing out and re-logging in before the next check."
             )
+            # Deliberately not notified: the site drops the session dozens of
+            # times a night and the bot always re-logs in by itself, so a
+            # message per drop was ~40 pings a day with nothing to act on. The
+            # actionable event is a re-login that *fails*, which the login
+            # retry loop above already reports as LOGIN_FAIL/STOP. The count
+            # stays in the log and in the daily report.
             log.warning(msg)
-            send_notification("SESSION", msg[:1900])
             sign_out_quietly()
             reset_appointment_page_state()
             first_loop = True

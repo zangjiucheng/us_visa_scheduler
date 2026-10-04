@@ -46,6 +46,25 @@ then the copy next to `visa.py` — so the service works from any working direct
 | `[TIME] WORK_LIMIT_TIME` / `WORK_COOLDOWN_TIME` | Hours of polling, then hours of break. The break is a blind spot — see *Coverage* below. `WORK_LIMIT_TIME = 0` disables it. |
 | `[LOGGING] LOG_DIR` / `LOG_RETENTION_DAYS` | Rotating daily log at `LOG_DIR/visa.log`, page dumps at `LOG_DIR/debug/`. |
 
+### What gets notified
+
+Discord is for things you would act on, so routine self-healing events stay in
+the log only:
+
+| Event | Notified? |
+| --- | --- |
+| A date appears in the target window / a booking succeeds or is uncertain | always |
+| Remaining reschedule attempts | only when the number changes |
+| Re-login fails, or the service gives up and exits | always |
+| Session dropped and re-login succeeded | no — counted in the daily report |
+| Repeated identical errors | collapsed by `NOTIFY_MIN_INTERVAL` |
+
+The session case is the one that matters in practice: the site expires the
+session dozens of times a night (measured: ~40 on a bad night, one surviving
+barely 70 seconds) and the bot always logs back in on its own. Paging once per
+drop meant ~40 messages a day with nothing to do about any of them, so the
+count is reported once a day instead.
+
 ### Coverage
 
 What catches a cancellation is not how fast you poll, it is how much of the

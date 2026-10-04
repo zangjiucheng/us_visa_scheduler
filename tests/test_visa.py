@@ -404,5 +404,44 @@ class RemainingAttemptsNoticeTest(unittest.TestCase):
         self.assertEqual(notify.call_count, 1)
 
 
+class DailyReportTest(unittest.TestCase):
+    def _reporter(self):
+        with mock.patch.object(visa, "send_notification"):
+            return visa.RunReporter()
+
+    def test_session_drops_are_counted_not_notified(self):
+        reporter = self._reporter()
+        with mock.patch.object(visa, "send_notification") as notify:
+            for _ in range(40):
+                reporter.record("SESSION")
+        # Routine drops self-recover; they must not page the user one by one.
+        notify.assert_not_called()
+        self.assertEqual(reporter.daily["sessions"], 40)
+
+    def test_states_land_in_their_own_counters(self):
+        reporter = self._reporter()
+        reporter.record("BANNED")
+        reporter.record("ERROR")
+        reporter.record("SESSION")
+        reporter.record("MONITORING")
+        self.assertEqual(
+            (reporter.daily["bans"], reporter.daily["errors"],
+             reporter.daily["sessions"], reporter.daily["requests"]),
+            (1, 1, 1, 4),
+        )
+
+    def test_daily_report_surfaces_the_drop_count(self):
+        reporter = self._reporter()
+        for _ in range(7):
+            reporter.record("SESSION")
+        reporter.daily_date = reporter.daily_date.replace(day=max(1, reporter.daily_date.day - 1))
+        with mock.patch.object(visa, "send_notification") as notify:
+            reporter.maybe_send_daily_report()
+        notify.assert_called_once()
+        self.assertIn("Session drops (auto-recovered): 7", notify.call_args[0][1])
+        # Counters reset for the new day.
+        self.assertEqual(reporter.daily["sessions"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
